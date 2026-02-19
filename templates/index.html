@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RL Image Extractor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <div class="header">
+        <div class="container">
+            <h1>Excel Image Extractor</h1>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="card">
+            <div class="instructions">
+                <h2>Instructions</h2>
+                <ol>
+                    <li>Upload your Excel file containing images</li>
+                    <li>Select the sheet containing your images</li>
+                    <li>Images should be in Column A</li>
+                    <li>Vendor Material numbers should be in Column D</li>
+                    <li>The process will create a ZIP file containing:
+                        <ul>
+                            <li>All extracted images named by vendor material number</li>
+                            <li>A summary file with processing details</li>
+                        </ul>
+                    </li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="upload-form">
+                <form id="uploadForm">
+                    <div class="file-input">
+                        <label for="excelFile" class="sr-only">Excel file</label>
+                        <input type="file" accept=".xlsx,.xlsm" required id="excelFile">
+                    </div>
+                    <button type="submit" class="button" id="uploadButton">Upload Excel File</button>
+                </form>
+            </div>
+
+            <div class="sheet-selection" id="sheetSelection">
+                <h3>Select Sheet</h3>
+                <div class="sheet-list" id="sheetList"></div>
+                <button class="button" id="processButton" disabled>Process Selected Sheet</button>
+            </div>
+
+            <div class="spinner" id="spinner" aria-hidden="true"></div>
+            <div class="progress-bar" id="progressBar" aria-hidden="true">
+                <div class="progress" id="progress"></div>
+            </div>
+            <div id="status" class="status" role="status" aria-live="polite"></div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>
