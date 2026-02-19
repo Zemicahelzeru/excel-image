@@ -583,29 +583,108 @@ def _collect_target_rows(ws, start_row, vendor_col, material_col):
 
 
 def _assign_entries_to_rows(target_rows, entries):
+    diagnostics = {
+        "strategy": "none",
+        "best_offset": 0,
+        "offset_match_count": 0,
+        "exact_row_matches": 0,
+    }
+
     if not target_rows or not entries:
-        return []
+        return [], diagnostics
 
     row_entries = [entry for entry in entries if entry.get("row") is not None]
     no_row_entries = [entry for entry in entries if entry.get("row") is None]
+    target_rows_sorted = sorted(target_rows)
 
     if not row_entries:
         mapped = []
-        for idx, row_idx in enumerate(target_rows):
+        for idx, row_idx in enumerate(target_rows_sorted):
             mapped.append((row_idx, no_row_entries[idx % len(no_row_entries)]))
-        return mapped
+        diagnostics["strategy"] = "no_row_data_cycle"
+        return mapped, diagnostics
 
     row_entries.sort(key=lambda item: item["row"])
-    mapped = []
-    pointer = 0
-    current = row_entries[0]
+    row_values = [entry["row"] for entry in row_entries]
+    row_set = set(row_values)
 
-    for row_idx in sorted(target_rows):
-        while pointer + 1 < len(row_entries) and row_entries[pointer + 1]["row"] <= row_idx:
-            pointer += 1
-            current = row_entries[pointer]
-        mapped.append((row_idx, current))
-    return mapped
+    best_offset = 0
+    best_match_count = -1
+    for offset in range(-10, 11):
+        count = sum(1 for row_idx in target_rows_sorted if (row_idx + offset) in row_set)
+        if count > best_match_count:
+            best_match_count = count
+            best_offset = offset
+
+    diagnostics["best_offset"] = best_offset
+    diagnostics["offset_match_count"] = max(best_match_count, 0)
+
+    # Build buckets so duplicate entry rows are handled safely.
+    row_buckets = {}
+    for entry in row_entries:
+        row_buckets.setdefault(entry["row"], []).append(entry)
+
+    mapped = []
+    used_entry_ids = set()
+    unassigned_rows = []
+
+    # Step 1: strict row (with inferred global offset) matching.
+    for row_idx in target_rows_sorted:
+        candidate_row = row_idx + best_offset
+        bucket = row_buckets.get(candidate_row, [])
+        entry = None
+        while bucket:
+            candidate = bucket.pop(0)
+            cid = id(candidate)
+            if cid not in used_entry_ids:
+                used_entry_ids.add(cid)
+                entry = candidate
+                break
+        if entry is not None:
+            mapped.append((row_idx, entry))
+            if entry.get("row") == row_idx:
+                diagnostics["exact_row_matches"] += 1
+        else:
+            unassigned_rows.append(row_idx)
+
+    # Step 2: assign remaining rows to remaining unused entries in order.
+    remaining_entries = [entry for entry in row_entries if id(entry) not in used_entry_ids]
+    remaining_entries.extend(no_row_entries)
+    assign_count = min(len(unassigned_rows), len(remaining_entries))
+    for idx in range(assign_count):
+        row_idx = unassigned_rows[idx]
+        entry = remaining_entries[idx]
+        used_entry_ids.add(id(entry))
+        mapped.append((row_idx, entry))
+        if entry.get("row") == row_idx:
+            diagnostics["exact_row_matches"] += 1
+    unassigned_rows = unassigned_rows[assign_count:]
+
+    # Step 3: if still rows remain, distribute nearest repeats by position.
+    if unassigned_rows:
+        source_pool = [entry for _, entry in sorted(mapped, key=lambda x: x[0])]
+        if not source_pool:
+            source_pool = row_entries or no_row_entries
+        pool_with_rows = [entry for entry in source_pool if entry.get("row") is not None]
+        for idx, row_idx in enumerate(unassigned_rows):
+            if pool_with_rows:
+                chosen = min(
+                    pool_with_rows,
+                    key=lambda item: (abs(item["row"] - row_idx), item["row"]),
+                )
+            elif len(source_pool) == 1:
+                chosen = source_pool[0]
+            else:
+                ratio = float(idx) / float(max(1, len(unassigned_rows) - 1))
+                pool_index = int(round(ratio * (len(source_pool) - 1)))
+                chosen = source_pool[pool_index]
+            mapped.append((row_idx, chosen))
+            if chosen.get("row") == row_idx:
+                diagnostics["exact_row_matches"] += 1
+
+    mapped.sort(key=lambda pair: pair[0])
+    diagnostics["strategy"] = "offset_then_ordered_then_repeat"
+    return mapped, diagnostics
 
 
 def _maybe_upscale_image(data, ext, scale_factor=3):
@@ -724,6 +803,12 @@ def extract_images():
     seen_filenames = set()
     extraction_mode = "none"
     upscaled_count = 0
+    mapping_info = {
+        "strategy": "none",
+        "best_offset": 0,
+        "offset_match_count": 0,
+        "exact_row_matches": 0,
+    }
 
     excel_name_no_ext = Path(original_filename).stem if original_filename else "Excel_Images"
     root_folder = _safe_folder_name(excel_name_no_ext)
@@ -774,7 +859,7 @@ def extract_images():
 
             # Primary behavior requested: one output image per vendor/material row.
             if source_entries and target_rows:
-                mapped_rows = _assign_entries_to_rows(target_rows, source_entries)
+                mapped_rows, mapping_info = _assign_entries_to_rows(target_rows, source_entries)
                 for row_idx, entry in mapped_rows:
                     safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
                     if not safe_code:
@@ -837,6 +922,10 @@ def extract_images():
                 "Drawing anchored images: {0}".format(len(drawing_entries)),
                 "XLSX media items: {0}".format(len(media_images)),
                 "Upscaled images (3x): {0}".format(upscaled_count),
+                "Mapping strategy: {0}".format(mapping_info.get("strategy")),
+                "Mapping best row offset: {0}".format(mapping_info.get("best_offset")),
+                "Mapping offset matches: {0}".format(mapping_info.get("offset_match_count")),
+                "Mapping exact row matches: {0}".format(mapping_info.get("exact_row_matches")),
                 "Extracted images: {0}".format(extracted_count),
                 "Skipped images: {0}".format(skipped_count),
                 "",
