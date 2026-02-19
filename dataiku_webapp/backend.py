@@ -458,10 +458,34 @@ def _cell_ref_to_row_col(cell_ref):
     return row_idx, col_idx
 
 
+def _extract_dispimg_key(formula):
+    if not formula:
+        return None
+    key_match = re.search(r'DISPIMG\(\s*"([^"]+)"', formula, flags=re.IGNORECASE)
+    if not key_match:
+        key_match = re.search(r"DISPIMG\(\s*'([^']+)'", formula, flags=re.IGNORECASE)
+    if not key_match:
+        return None
+    key = (key_match.group(1) or "").strip()
+    return key or None
+
+
+def _normalize_mapping_key(key):
+    return (key or "").strip().upper()
+
+
+def _xml_local_name(tag):
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
 def _extract_dispimg_row_map(archive, sheet_path, image_col, start_row):
     ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     row_map = {}
     sheet_root = ET.fromstring(archive.read(sheet_path))
+    shared_formula_by_si = {}
+
     for cell in sheet_root.findall(".//main:c", ns):
         cell_ref = cell.attrib.get("r")
         row_idx, col_idx = _cell_ref_to_row_col(cell_ref)
@@ -469,15 +493,17 @@ def _extract_dispimg_row_map(archive, sheet_path, image_col, start_row):
             continue
         if col_idx != image_col or row_idx < start_row:
             continue
-        formula = cell.findtext("main:f", default="", namespaces=ns) or ""
-        if "DISPIMG" not in formula.upper():
-            continue
-        key_match = re.search(r'DISPIMG\(\s*"([^"]+)"', formula, flags=re.IGNORECASE)
-        if not key_match:
-            key_match = re.search(r"DISPIMG\(\s*'([^']+)'", formula, flags=re.IGNORECASE)
-        if not key_match:
-            continue
-        key = key_match.group(1).strip()
+        f_node = cell.find("main:f", ns)
+        formula = ""
+        if f_node is not None:
+            formula = (f_node.text or "").strip()
+            si = f_node.attrib.get("si")
+            f_type = f_node.attrib.get("t")
+            if si and formula:
+                shared_formula_by_si[si] = formula
+            if si and not formula and (f_type == "shared" or f_type is None):
+                formula = shared_formula_by_si.get(si, "")
+        key = _extract_dispimg_key(formula)
         if key:
             row_map[row_idx] = key
     return row_map
@@ -494,14 +520,14 @@ def _find_cellimages_part_path(archive):
     for candidate in ("xl/cellimages.xml", "xl/cellImages.xml"):
         if candidate in archive.namelist():
             return candidate
+    for name in archive.namelist():
+        lower = name.lower()
+        if lower.startswith("xl/") and lower.endswith(".xml") and "cell" in lower and "image" in lower:
+            return name
     return None
 
 
 def _extract_cellimages_by_key(archive, cellimages_path):
-    ns = {
-        "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
-        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-    }
     rels_path = "{0}/_rels/{1}.rels".format(
         posixpath.dirname(cellimages_path),
         posixpath.basename(cellimages_path),
@@ -509,33 +535,66 @@ def _extract_cellimages_by_key(archive, cellimages_path):
     rels_map = _read_relationships(archive, rels_path)
     root = ET.fromstring(archive.read(cellimages_path))
     images_by_key = {}
+    ordered_images = []
+    seen_source = set()
 
-    for pic in root.findall(".//xdr:pic", ns):
-        c_nv_pr = pic.find(".//xdr:cNvPr", ns)
-        if c_nv_pr is None:
+    for node in root.iter():
+        # Heuristic: picture-like nodes
+        local = _xml_local_name(node.tag).lower()
+        if local not in {"pic", "cellimage", "image", "onecellanchor", "twocellanchor"}:
             continue
-        key_name = (c_nv_pr.attrib.get("name") or "").strip()
-        if not key_name:
+
+        rel_ids = []
+        for sub in node.iter():
+            for attr_name, attr_value in sub.attrib.items():
+                attr_local = _xml_local_name(attr_name).lower()
+                if attr_local == "embed" and attr_value:
+                    rel_ids.append(attr_value)
+
+        media_path = None
+        data = None
+        ext = None
+        for rel_id in rel_ids:
+            target = rels_map.get(rel_id)
+            candidate_media_path = _resolve_zip_path(cellimages_path, target)
+            if candidate_media_path and candidate_media_path in archive.namelist():
+                candidate_data = archive.read(candidate_media_path)
+                if candidate_data:
+                    media_path = candidate_media_path
+                    data = candidate_data
+                    ext = _normalize_ext(Path(candidate_media_path).suffix, candidate_data)
+                    break
+        if not media_path or data is None:
             continue
-        blip = pic.find(".//a:blip", ns)
-        if blip is None:
-            continue
-        rel_id = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-        target = rels_map.get(rel_id)
-        media_path = _resolve_zip_path(cellimages_path, target)
-        if not media_path or media_path not in archive.namelist():
-            continue
-        data = archive.read(media_path)
-        if not data:
-            continue
-        item = {
+
+        key_candidates = []
+        for sub in node.iter():
+            for attr_name, attr_value in sub.attrib.items():
+                attr_local = _xml_local_name(attr_name).lower()
+                if attr_local in {"name", "id", "title", "descr"} and attr_value:
+                    key_candidates.append(str(attr_value).strip())
+            if sub.text:
+                txt = sub.text.strip()
+                if txt and txt.upper().startswith("ID_"):
+                    key_candidates.append(txt)
+
+        record = {
             "data": data,
-            "ext": _normalize_ext(Path(media_path).suffix, data),
-            "source": "cellimages:{0}".format(key_name),
+            "ext": ext or "png",
+            "source": "cellimages:{0}".format(media_path),
         }
-        images_by_key[key_name] = item
-        images_by_key[key_name.upper()] = item
-    return images_by_key
+
+        if media_path not in seen_source:
+            ordered_images.append(record)
+            seen_source.add(media_path)
+
+        for key_name in key_candidates:
+            norm = _normalize_mapping_key(key_name)
+            if not norm:
+                continue
+            images_by_key[norm] = record
+
+    return images_by_key, ordered_images
 
 
 def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
@@ -551,13 +610,26 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
         cellimages_path = _find_cellimages_part_path(archive)
         if not cellimages_path:
             return entries
-        images_by_key = _extract_cellimages_by_key(archive, cellimages_path)
-        if not images_by_key:
+        images_by_key, ordered_images = _extract_cellimages_by_key(archive, cellimages_path)
+        if not images_by_key and not ordered_images:
             return entries
 
+        # Fallback by first-appearance order if direct key lookup fails.
+        ordered_unique_keys = []
+        seen_keys = set()
         for row_idx in sorted(row_key_map.keys()):
-            key = row_key_map[row_idx]
-            image_item = images_by_key.get(key) or images_by_key.get(key.upper())
+            norm = _normalize_mapping_key(row_key_map[row_idx])
+            if norm and norm not in seen_keys:
+                ordered_unique_keys.append(norm)
+                seen_keys.add(norm)
+        order_key_to_image = {}
+        for idx, norm_key in enumerate(ordered_unique_keys):
+            if idx < len(ordered_images):
+                order_key_to_image[norm_key] = ordered_images[idx]
+
+        for row_idx in sorted(row_key_map.keys()):
+            norm_key = _normalize_mapping_key(row_key_map[row_idx])
+            image_item = images_by_key.get(norm_key) or order_key_to_image.get(norm_key)
             if not image_item:
                 continue
             entries.append(
@@ -566,7 +638,7 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
                     "col": image_col,
                     "ext": image_item["ext"],
                     "data": image_item["data"],
-                    "source": "dispimg:{0}".format(key),
+                    "source": "dispimg:{0}".format(norm_key or row_idx),
                 }
             )
     return entries
