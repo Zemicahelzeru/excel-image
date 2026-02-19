@@ -422,6 +422,112 @@ def _extract_drawing_images_for_sheet(file_bytes, sheet_name):
     return entries
 
 
+def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row):
+    entries = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
+        sheet_path = _sheet_path_for_name(archive, sheet_name)
+        if not sheet_path or sheet_path not in archive.namelist():
+            return entries
+
+        sheet_rels_path = "{0}/_rels/{1}.rels".format(
+            posixpath.dirname(sheet_path),
+            posixpath.basename(sheet_path),
+        )
+        sheet_rels = _read_relationships(archive, sheet_rels_path)
+        if not sheet_rels:
+            return entries
+
+        candidate_parts = []
+        for rid, target in sheet_rels.items():
+            resolved = _resolve_zip_path(sheet_path, target)
+            if not resolved or resolved not in archive.namelist():
+                continue
+            lower = resolved.lower()
+            if not lower.endswith(".xml"):
+                continue
+            if "drawing" in lower or "cellimage" in lower:
+                candidate_parts.append((rid, resolved))
+
+        seen = set()
+        idx = 0
+        for _rid, part_path in candidate_parts:
+            if part_path in seen:
+                continue
+            seen.add(part_path)
+
+            try:
+                root = ET.fromstring(archive.read(part_path))
+            except Exception:
+                continue
+
+            rels_path = "{0}/_rels/{1}.rels".format(
+                posixpath.dirname(part_path),
+                posixpath.basename(part_path),
+            )
+            part_rels = _read_relationships(archive, rels_path)
+            if not part_rels:
+                continue
+
+            for anchor in root.iter():
+                local = _xml_local_name(anchor.tag).lower()
+                if local not in {"onecellanchor", "twocellanchor"}:
+                    continue
+
+                row = None
+                col = None
+                from_node = None
+                for child in anchor.iter():
+                    if _xml_local_name(child.tag).lower() == "from":
+                        from_node = child
+                        break
+                if from_node is not None:
+                    for part in from_node:
+                        part_name = _xml_local_name(part.tag).lower()
+                        part_text = (part.text or "").strip()
+                        if part_name == "row" and part_text.isdigit():
+                            row = int(part_text) + 1
+                        elif part_name == "col" and part_text.isdigit():
+                            col = int(part_text) + 1
+
+                if row is None:
+                    continue
+                if start_row and row < start_row:
+                    continue
+
+                embed_rel = None
+                for child in anchor.iter():
+                    for attr_name, attr_value in child.attrib.items():
+                        if _xml_local_name(attr_name).lower() == "embed" and attr_value:
+                            embed_rel = attr_value
+                            break
+                    if embed_rel:
+                        break
+                if not embed_rel:
+                    continue
+
+                target = part_rels.get(embed_rel)
+                media_path = _resolve_zip_path(part_path, target)
+                if not media_path or media_path not in archive.namelist():
+                    continue
+                data = archive.read(media_path)
+                if not data:
+                    continue
+
+                idx += 1
+                entries.append(
+                    {
+                        "row": row,
+                        "col": col,
+                        "ext": _normalize_ext(Path(media_path).suffix, data),
+                        "data": data,
+                        "source": "sheet_related_anchor:{0}".format(idx),
+                    }
+                )
+
+    entries.sort(key=lambda item: (item.get("row") or 10**9, item.get("col") or 10**9, item["source"]))
+    return entries
+
+
 def _extract_openpyxl_images(images):
     entries = []
     for idx, img in enumerate(images, start=1):
@@ -878,6 +984,7 @@ def extract_images():
     openpyxl_images = list(getattr(ws, "_images", []) or [])
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
     drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name)
+    related_anchor_entries = _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row)
     dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
     cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
@@ -914,6 +1021,9 @@ def extract_images():
             if dispimg_entries:
                 source_entries = dispimg_entries
                 extraction_mode = "dispimg_cellimages"
+            elif related_anchor_entries:
+                source_entries = related_anchor_entries
+                extraction_mode = "sheet_related_anchor"
             elif cellimages_anchor_entries:
                 source_entries = cellimages_anchor_entries
                 extraction_mode = "cellimages_anchor"
@@ -1032,6 +1142,7 @@ def extract_images():
                 "Data start row: {0}".format(start_row),
                 "Vendor/material target rows: {0}".format(len(target_rows)),
                 "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
+                "Sheet-related row-anchored entries: {0}".format(len(related_anchor_entries)),
                 "Cellimages row-anchored entries: {0}".format(len(cellimages_anchor_entries)),
                 "DISPIMG formula rows in image column: {0}".format(len(dispimg_row_keys)),
                 "Openpyxl anchored images: {0}".format(len(openpyxl_entries)),
