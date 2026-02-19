@@ -1,6 +1,18 @@
-# Excel Image Extractor (Flask)
+# Excel Image Extractor
 
-This app extracts images from an Excel workbook and downloads them as a ZIP file.
+This project contains an Excel image extraction webapp.
+
+## Dataiku-first setup (recommended)
+
+If your target is Dataiku only, use the ready-to-paste bundle in:
+
+```
+dataiku_webapp/
+```
+
+Detailed steps:
+
+- `dataiku_webapp/README_DATAIKU.md`
 
 ## What it does
 
@@ -12,7 +24,12 @@ This app extracts images from an Excel workbook and downloads them as a ZIP file
   - `images/...`
   - `summary.txt`
 
-## Project structure
+## Included implementations
+
+- **Dataiku webapp bundle** (copy/paste into DSS tabs)
+- **Standalone Flask app** (optional local run)
+
+## Local Flask structure (optional)
 
 ```
 app.py
@@ -21,6 +38,12 @@ templates/
 static/
   styles.css
   app.js
+dataiku_webapp/
+  backend.py
+  index.html
+  styles.css
+  script.js
+  README_DATAIKU.md
 ```
 
 ## Run locally
