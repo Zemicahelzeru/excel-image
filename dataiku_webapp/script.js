@@ -113,6 +113,19 @@
         });
     }
 
+    function friendlyErrorMessage(error, phase) {
+      const message = (error && error.message) || String(error || "");
+      if (/Failed to fetch/i.test(message)) {
+        return (
+          "Cannot reach backend during " +
+          phase +
+          ". In Dataiku this usually means backend crash, backend timeout, or backend restart. " +
+          "Open webapp backend logs and restart the backend."
+        );
+      }
+      return message || "Unexpected error";
+    }
+
     function resetSheetSelection() {
       sheetSelection.style.display = "none";
       sheetList.innerHTML = "";
@@ -141,7 +154,12 @@
     }
 
     function getSheets(formData) {
-      return fetch(apiUrl("/get_sheets"), { method: "POST", body: formData }).then(
+      return fetch(apiUrl("/get_sheets"), {
+        method: "POST",
+        body: formData,
+        credentials: "same-origin",
+        cache: "no-store",
+      }).then(
         function (response) {
           if (!response.ok) {
             return parseError(response).then(function (message) {
@@ -154,7 +172,12 @@
     }
 
     function extractImages(formData) {
-      return fetch(apiUrl("/extract_images"), { method: "POST", body: formData }).then(
+      return fetch(apiUrl("/extract_images"), {
+        method: "POST",
+        body: formData,
+        credentials: "same-origin",
+        cache: "no-store",
+      }).then(
         function (response) {
           if (!response.ok) {
             return parseError(response).then(function (message) {
@@ -172,7 +195,7 @@
     }
 
     function runHealthCheck() {
-      fetch(apiUrl("/health"))
+      fetch(apiUrl("/health"), { credentials: "same-origin", cache: "no-store" })
         .then(function (response) {
           if (!response.ok) {
             throw new Error("Health check failed");
@@ -233,7 +256,7 @@
           showStatus("Select a sheet containing images.", "info");
         })
         .catch(function (error) {
-          showStatus("Error: " + error.message, "error");
+          showStatus("Error: " + friendlyErrorMessage(error, "sheet loading"), "error");
           console.error("get_sheets error:", error);
         })
         .finally(function () {
@@ -277,7 +300,7 @@
           showStatus("Images extracted successfully! Check your Downloads folder.", "success");
         })
         .catch(function (error) {
-          showStatus("Error: " + error.message, "error");
+          showStatus("Error: " + friendlyErrorMessage(error, "image extraction"), "error");
           console.error("extract_images error:", error);
         })
         .finally(function () {

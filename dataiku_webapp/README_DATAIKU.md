@@ -36,6 +36,21 @@ Copy each file content into the matching Dataiku tab:
 3. Upload an `.xlsx` or `.xlsm`.
 4. Select sheet and process.
 
+## Troubleshooting
+
+### `Error: Failed to fetch` on Process
+
+This is usually a backend/runtime issue in Dataiku, not a frontend validation issue.
+
+Check:
+
+1. **Backend state** in the webapp editor (must be running).
+2. **Backend logs** for Python exceptions or timeout.
+3. `openpyxl` installed in the webapp code environment.
+4. Restart webapp backend after any dependency/code change.
+
+If you see `Webapp backend start timeout`, fix the backend environment first (packages / startup errors), then restart.
+
 ## Behavior
 
 - Extracts only images anchored in **Column A**

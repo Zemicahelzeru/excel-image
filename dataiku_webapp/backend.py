@@ -1,12 +1,14 @@
 import io
+import os
 import re
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
 
 import openpyxl
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, after_this_request, jsonify, request, send_file
+from werkzeug.exceptions import HTTPException
 
 # In Dataiku webapps, "app" is usually already provided.
 # This fallback keeps the file runnable outside Dataiku for local testing.
@@ -91,12 +93,26 @@ def _get_uploaded_file():
 
 
 def _send_zip_response(stream, filename):
-    send_kwargs = dict(mimetype="application/zip", as_attachment=True)
+    send_kwargs = dict(
+        mimetype="application/zip",
+        as_attachment=True,
+        conditional=False,
+        etag=False,
+        max_age=0,
+    )
     try:
         return send_file(stream, download_name=filename, **send_kwargs)
     except TypeError:
         # Compatibility with older Flask versions.
         return send_file(stream, attachment_filename=filename, **send_kwargs)
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected_error(exc):
+    if isinstance(exc, HTTPException):
+        return exc
+    app.logger.exception("Unhandled webapp backend exception")
+    return _json_error("Backend error while processing request: {0}".format(exc), 500)
 
 
 @app.route("/health")
@@ -134,7 +150,7 @@ def extract_images():
         return _json_error("Missing sheet_name", 400)
 
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, keep_links=False)
     except Exception as exc:
         return _json_error("Could not open workbook: {0}".format(exc), 400)
 
@@ -145,68 +161,94 @@ def extract_images():
     ws = wb[sheet_name]
     images = list(getattr(ws, "_images", []) or [])
 
-    output_stream = io.BytesIO()
     extracted_count = 0
     skipped_count = 0
     skipped_reasons = []
     seen_filenames = set()
 
-    with zipfile.ZipFile(output_stream, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for idx, img in enumerate(images, start=1):
-            row, col = _anchor_row_col(img)
-            if col != 1:
-                skipped_count += 1
-                skipped_reasons.append(
-                    "Image #{0}: skipped (not in Column A). Found column={1}.".format(
-                        idx, col or "unknown"
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix="dataiku_excel_images_",
+        suffix=".zip",
+        delete=False,
+    )
+    zip_path = temp_file.name
+    temp_file.close()
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for idx, img in enumerate(images, start=1):
+                row, col = _anchor_row_col(img)
+                if col != 1:
+                    skipped_count += 1
+                    skipped_reasons.append(
+                        "Image #{0}: skipped (not in Column A). Found column={1}.".format(
+                            idx, col or "unknown"
+                        )
                     )
-                )
-                continue
+                    continue
 
-            vendor = _read_up(ws, row, 4)
-            safe_vendor = _safe_name(vendor) if vendor else "Row_{0}".format(row or idx)
+                vendor = _read_up(ws, row, 4)
+                safe_vendor = _safe_name(vendor) if vendor else "Row_{0}".format(row or idx)
 
-            try:
-                image_data = img._data()
-            except Exception as exc:
-                skipped_count += 1
-                skipped_reasons.append(
-                    "Image #{0}: could not read image data ({1}).".format(idx, exc)
-                )
-                continue
+                try:
+                    image_data = img._data()
+                except Exception as exc:
+                    skipped_count += 1
+                    skipped_reasons.append(
+                        "Image #{0}: could not read image data ({1}).".format(idx, exc)
+                    )
+                    continue
 
-            ext = _detect_ext(image_data)
-            filename = _next_unique_filename(safe_vendor, ext, seen_filenames)
-            zip_file.writestr("images/{0}".format(filename), image_data)
-            extracted_count += 1
+                ext = _detect_ext(image_data)
+                filename = _next_unique_filename(safe_vendor, ext, seen_filenames)
+                zip_file.writestr("images/{0}".format(filename), image_data)
+                extracted_count += 1
 
-        summary_lines = [
-            "Excel Image Extraction Summary",
-            "==============================",
-            "Generated at: {0}Z".format(datetime.utcnow().isoformat()),
-            "Sheet: {0}".format(sheet_name),
-            "Total images found in sheet: {0}".format(len(images)),
-            "Extracted images: {0}".format(extracted_count),
-            "Skipped images: {0}".format(skipped_count),
-            "",
-            "Rules:",
-            "- Images are extracted only when anchored in Column A.",
-            "- File names are based on nearest non-empty value above/in Column D.",
-            "",
-        ]
-        if skipped_reasons:
-            summary_lines.append("Skipped details:")
-            summary_lines.extend("- {0}".format(reason) for reason in skipped_reasons)
+            summary_lines = [
+                "Excel Image Extraction Summary",
+                "==============================",
+                "Generated at: {0}Z".format(datetime.utcnow().isoformat()),
+                "Sheet: {0}".format(sheet_name),
+                "Total images found in sheet: {0}".format(len(images)),
+                "Extracted images: {0}".format(extracted_count),
+                "Skipped images: {0}".format(skipped_count),
+                "",
+                "Rules:",
+                "- Images are extracted only when anchored in Column A.",
+                "- File names are based on nearest non-empty value above/in Column D.",
+                "",
+            ]
+            if skipped_reasons:
+                summary_lines.append("Skipped details:")
+                summary_lines.extend("- {0}".format(reason) for reason in skipped_reasons)
 
-        zip_file.writestr("summary.txt", "\n".join(summary_lines))
+            zip_file.writestr("summary.txt", "\n".join(summary_lines))
+    except Exception:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        wb.close()
+        raise
 
     wb.close()
-    output_stream.seek(0)
 
     if extracted_count == 0:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
         return _json_error(
             "No images were extracted. Ensure images are in Column A and not empty.",
             400,
         )
 
-    return _send_zip_response(output_stream, "images.zip")
+    @after_this_request
+    def _cleanup_temp_file(response):
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return response
+
+    return _send_zip_response(zip_path, "images.zip")
