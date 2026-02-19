@@ -633,6 +633,83 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
     return entries
 
 
+def _extract_cellimages_anchor_entries(file_bytes, image_col, start_row):
+    entries = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
+        cellimages_path = _find_cellimages_part_path(archive)
+        if not cellimages_path or cellimages_path not in archive.namelist():
+            return entries
+
+        rels_path = "{0}/_rels/{1}.rels".format(
+            posixpath.dirname(cellimages_path),
+            posixpath.basename(cellimages_path),
+        )
+        rels_map = _read_relationships(archive, rels_path)
+        if not rels_map:
+            return entries
+
+        root = ET.fromstring(archive.read(cellimages_path))
+        entry_idx = 0
+        for anchor in root.iter():
+            anchor_local = _xml_local_name(anchor.tag).lower()
+            if anchor_local not in {"onecellanchor", "twocellanchor"}:
+                continue
+
+            row = None
+            col = None
+            from_node = None
+            for child in anchor.iter():
+                if _xml_local_name(child.tag).lower() == "from":
+                    from_node = child
+                    break
+            if from_node is not None:
+                for part in from_node:
+                    part_name = _xml_local_name(part.tag).lower()
+                    part_text = (part.text or "").strip()
+                    if part_name == "row" and part_text.isdigit():
+                        row = int(part_text) + 1
+                    elif part_name == "col" and part_text.isdigit():
+                        col = int(part_text) + 1
+
+            if row is None:
+                continue
+            if start_row and row < start_row:
+                continue
+
+            embed_rel = None
+            for child in anchor.iter():
+                for attr_name, attr_value in child.attrib.items():
+                    if _xml_local_name(attr_name).lower() == "embed" and attr_value:
+                        embed_rel = attr_value
+                        break
+                if embed_rel:
+                    break
+            if not embed_rel:
+                continue
+
+            target = rels_map.get(embed_rel)
+            media_path = _resolve_zip_path(cellimages_path, target)
+            if not media_path or media_path not in archive.namelist():
+                continue
+            data = archive.read(media_path)
+            if not data:
+                continue
+
+            entry_idx += 1
+            entries.append(
+                {
+                    "row": row,
+                    "col": col,
+                    "ext": _normalize_ext(Path(media_path).suffix, data),
+                    "data": data,
+                    "source": "cellimages_anchor:{0}".format(entry_idx),
+                }
+            )
+
+    entries.sort(key=lambda item: (item.get("row") or 10**9, item.get("col") or 10**9, item["source"]))
+    return entries
+
+
 def _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row):
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
         sheet_path = _sheet_path_for_name(archive, sheet_name)
@@ -802,6 +879,7 @@ def extract_images():
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
     drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name)
     dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
+    cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
     media_images = _extract_media_images(file_bytes)
 
@@ -836,6 +914,9 @@ def extract_images():
             if dispimg_entries:
                 source_entries = dispimg_entries
                 extraction_mode = "dispimg_cellimages"
+            elif cellimages_anchor_entries:
+                source_entries = cellimages_anchor_entries
+                extraction_mode = "cellimages_anchor"
             elif drawing_entries:
                 source_entries = drawing_entries
                 extraction_mode = "drawing_anchor"
@@ -951,6 +1032,7 @@ def extract_images():
                 "Data start row: {0}".format(start_row),
                 "Vendor/material target rows: {0}".format(len(target_rows)),
                 "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
+                "Cellimages row-anchored entries: {0}".format(len(cellimages_anchor_entries)),
                 "DISPIMG formula rows in image column: {0}".format(len(dispimg_row_keys)),
                 "Openpyxl anchored images: {0}".format(len(openpyxl_entries)),
                 "Drawing anchored images: {0}".format(len(drawing_entries)),
