@@ -856,125 +856,55 @@ def extract_images():
             # Strict behavior requested: same row only (vendor row Dn -> image row An).
             if source_entries and target_rows:
                 mapped_rows, mapping_info = _assign_entries_to_rows(target_rows, source_entries, image_col)
-                for row_idx, entry in mapped_rows:
-                    safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                    if not safe_code:
-                        safe_code = "Row_{0}".format(row_idx)
-                    if code_source == "material":
-                        skipped_reasons.append(
-                            "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
-                        )
-
-                    out_data, out_ext, did_upscale = _prepared_image(entry)
-                    if did_upscale:
-                        upscaled_count += 1
-
-                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
-                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
-                    extracted_count += 1
-
                 missing_rows = mapping_info.get("missing_rows") or []
                 if missing_rows:
+                    extraction_mode = "strict_row_locked_missing_rows"
                     skipped_count += len(missing_rows)
                     preview = ",".join(str(r) for r in missing_rows[:20])
                     skipped_reasons.append(
-                        "Strict same-row mapping missing image rows: {0}{1}".format(
+                        "Strict row-locked mapping missing image rows: {0}{1}. "
+                        "No cross-row fallback is allowed.".format(
                             preview,
                             "..." if len(missing_rows) > 20 else "",
                         )
                     )
+                else:
+                    for row_idx, entry in mapped_rows:
+                        safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
+                        if not safe_code:
+                            safe_code = "Row_{0}".format(row_idx)
+                        if code_source == "material":
+                            skipped_reasons.append(
+                                "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                            )
 
-            elif target_rows and media_images:
-                # Accuracy-first rule:
-                # if DISPIMG formulas exist but we could not build deterministic key->image mapping,
-                # do not guess from media order.
+                        out_data, out_ext, did_upscale = _prepared_image(entry)
+                        if did_upscale:
+                            upscaled_count += 1
+
+                        filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                        zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                        extracted_count += 1
+
+            elif target_rows:
+                extraction_mode = "strict_row_locked_no_row_anchors"
+                mapping_info["strategy"] = "strict_row_locked_no_row_anchors"
+                mapping_info["missing_rows"] = sorted(target_rows)
+                skipped_count += len(target_rows)
+
                 if dispimg_row_keys:
-                    extraction_mode = "blocked_ambiguous_dispimg_media"
-                    mapping_info["strategy"] = "blocked_ambiguous_dispimg_media"
-                    mapping_info["missing_rows"] = sorted(target_rows)
-                    skipped_count += len(target_rows)
                     skipped_reasons.append(
                         "Found DISPIMG formulas in Column A, but deterministic formula-ID to media mapping was incomplete. "
-                        "Heuristic media fallback is disabled to protect naming accuracy."
+                        "Strict row-locked mode blocks all media-order fallback to protect naming accuracy."
                     )
-                elif len(media_images) == len(target_rows):
-                    extraction_mode = "xlsx_media_fallback_equal_count_only"
-                    mapping_info["strategy"] = "sequential_equal_count_only"
-                    for idx, row_idx in enumerate(sorted(target_rows)):
-                        media = media_images[idx]
-                        safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                        if not safe_code:
-                            safe_code = "Row_{0}".format(row_idx)
-                        if code_source == "material":
-                            skipped_reasons.append(
-                                "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
-                            )
-                        out_data, out_ext, did_upscale = _maybe_upscale_image(
-                            media["data"], media["ext"], scale_factor=3
-                        )
-                        if did_upscale:
-                            upscaled_count += 1
-                        filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
-                        zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
-                        extracted_count += 1
-                    mapping_info["exact_row_matches"] = len(target_rows)
-                    mapping_info["strict_col_matches"] = len(target_rows)
-                    mapping_info["missing_rows"] = []
-                else:
-                    extraction_mode = "code_grouped_media_fallback"
-                    mapping_info["strategy"] = "code_grouped_media_fallback"
-
-                    code_to_media = {}
-                    media_ptr = 0
-                    unresolved_rows = []
-
-                    for row_idx in sorted(target_rows):
-                        safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                        if not safe_code:
-                            safe_code = "Row_{0}".format(row_idx)
-                        code_key = safe_code.upper()
-
-                        media = code_to_media.get(code_key)
-                        if media is None:
-                            if media_ptr < len(media_images):
-                                media = media_images[media_ptr]
-                                code_to_media[code_key] = media
-                                media_ptr += 1
-                            else:
-                                unresolved_rows.append(row_idx)
-                                continue
-
-                        if code_source == "material":
-                            skipped_reasons.append(
-                                "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
-                            )
-
-                        out_data, out_ext, did_upscale = _maybe_upscale_image(
-                            media["data"], media["ext"], scale_factor=3
-                        )
-                        if did_upscale:
-                            upscaled_count += 1
-
-                        filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
-                        zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
-                        extracted_count += 1
-
-                    mapping_info["exact_row_matches"] = extracted_count
-                    mapping_info["strict_col_matches"] = extracted_count
-                    mapping_info["missing_rows"] = unresolved_rows
-                    if unresolved_rows:
-                        skipped_count += len(unresolved_rows)
-                        preview = ",".join(str(r) for r in unresolved_rows[:20])
-                        skipped_reasons.append(
-                            "Media exhausted while assigning unique vendor codes. Missing rows: {0}{1}".format(
-                                preview,
-                                "..." if len(unresolved_rows) > 20 else "",
-                            )
-                        )
+                elif media_images:
                     skipped_reasons.append(
-                        "Counts differ (media={0}, rows={1}); grouped fallback used same image for repeated vendor codes.".format(
-                            len(media_images), len(target_rows)
-                        )
+                        "Found {0} media images but no reliable row anchors. "
+                        "Strict row-locked mode forbids assigning by order or by code groups.".format(len(media_images))
+                    )
+                else:
+                    skipped_reasons.append(
+                        "No row-anchored images were found for strict row-locked mapping."
                     )
 
             # If no vendor/material rows were found, still export discovered images.
@@ -1037,7 +967,8 @@ def extract_images():
                 "- Strict same-row mapping: vendor/material row N uses image row N.",
                 "- Row mapping starts after detected header rows.",
                 "- No nearest-row guessing and no offset guessing.",
-                "- If strict row mapping is incomplete, missing rows are reported in summary.",
+                "- No media-order fallback and no vendor-group fallback are allowed.",
+                "- If strict row mapping is incomplete, extraction is blocked and rows are reported.",
                 "- Preferred name is Vendor Material from detected vendor column.",
                 "- If Vendor is empty and Original Material exists, file uses MAT_<material>.",
                 "",
