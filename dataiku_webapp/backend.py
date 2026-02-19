@@ -907,10 +907,58 @@ def extract_images():
                 mapping_info["missing_rows"] = []
 
             elif target_rows and media_images and len(media_images) != len(target_rows):
-                extraction_mode = "strict_row_map_failed_media_count_mismatch"
-                skipped_count += len(target_rows)
+                extraction_mode = "code_grouped_media_fallback"
+                mapping_info["strategy"] = "code_grouped_media_fallback"
+
+                code_to_media = {}
+                media_ptr = 0
+                unresolved_rows = []
+
+                for row_idx in sorted(target_rows):
+                    safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
+                    if not safe_code:
+                        safe_code = "Row_{0}".format(row_idx)
+                    code_key = safe_code.upper()
+
+                    media = code_to_media.get(code_key)
+                    if media is None:
+                        if media_ptr < len(media_images):
+                            media = media_images[media_ptr]
+                            code_to_media[code_key] = media
+                            media_ptr += 1
+                        else:
+                            unresolved_rows.append(row_idx)
+                            continue
+
+                    if code_source == "material":
+                        skipped_reasons.append(
+                            "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                        )
+
+                    out_data, out_ext, did_upscale = _maybe_upscale_image(
+                        media["data"], media["ext"], scale_factor=3
+                    )
+                    if did_upscale:
+                        upscaled_count += 1
+
+                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                    extracted_count += 1
+
+                mapping_info["exact_row_matches"] = extracted_count
+                mapping_info["strict_col_matches"] = extracted_count
+                mapping_info["missing_rows"] = unresolved_rows
+                if unresolved_rows:
+                    skipped_count += len(unresolved_rows)
+                    preview = ",".join(str(r) for r in unresolved_rows[:20])
+                    skipped_reasons.append(
+                        "Media exhausted while assigning unique vendor codes. Missing rows: {0}{1}".format(
+                            preview,
+                            "..." if len(unresolved_rows) > 20 else "",
+                        )
+                    )
                 skipped_reasons.append(
-                    "Strict mapping blocked fallback because media count ({0}) != vendor/material row count ({1}).".format(
+                    "Counts differ (media={0}, rows={1}); grouped fallback used same image for repeated vendor codes.".format(
                         len(media_images), len(target_rows)
                     )
                 )
