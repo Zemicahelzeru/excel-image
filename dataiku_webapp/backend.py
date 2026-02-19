@@ -241,11 +241,10 @@ def _detect_layout(ws):
     vendor_col = vendor_header[1] if vendor_header else _detect_vendor_column(ws)
     material_col = material_header[1] if material_header else _detect_material_column(ws, vendor_col)
 
-    header_rows = [
-        row
-        for row, _ in [image_header, vendor_header, material_header]
-        if row is not None
-    ]
+    header_rows = []
+    for header in (image_header, vendor_header, material_header):
+        if header is not None:
+            header_rows.append(header[0])
     start_row = max(header_rows) + 1 if header_rows else 2
 
     return {
@@ -654,108 +653,55 @@ def _collect_target_rows(ws, start_row, vendor_col, material_col):
     return rows
 
 
-def _assign_entries_to_rows(target_rows, entries):
+def _assign_entries_to_rows(target_rows, entries, image_col):
     diagnostics = {
-        "strategy": "none",
-        "best_offset": 0,
-        "offset_match_count": 0,
+        "strategy": "strict_same_row",
         "exact_row_matches": 0,
+        "strict_col_matches": 0,
+        "missing_rows": [],
     }
 
     if not target_rows or not entries:
+        diagnostics["missing_rows"] = sorted(target_rows or [])
         return [], diagnostics
 
     row_entries = [entry for entry in entries if entry.get("row") is not None]
-    no_row_entries = [entry for entry in entries if entry.get("row") is None]
-    target_rows_sorted = sorted(target_rows)
-
     if not row_entries:
-        mapped = []
-        for idx, row_idx in enumerate(target_rows_sorted):
-            mapped.append((row_idx, no_row_entries[idx % len(no_row_entries)]))
-        diagnostics["strategy"] = "no_row_data_cycle"
-        return mapped, diagnostics
+        diagnostics["strategy"] = "no_row_entries"
+        diagnostics["missing_rows"] = sorted(target_rows)
+        return [], diagnostics
 
-    row_entries.sort(key=lambda item: item["row"])
-    row_values = [entry["row"] for entry in row_entries]
-    row_set = set(row_values)
-
-    best_offset = 0
-    best_match_count = -1
-    for offset in range(-10, 11):
-        count = sum(1 for row_idx in target_rows_sorted if (row_idx + offset) in row_set)
-        if count > best_match_count:
-            best_match_count = count
-            best_offset = offset
-
-    diagnostics["best_offset"] = best_offset
-    diagnostics["offset_match_count"] = max(best_match_count, 0)
-
-    # Build buckets so duplicate entry rows are handled safely.
-    row_buckets = {}
+    strict_row_map = {}
+    anycol_row_map = {}
     for entry in row_entries:
-        row_buckets.setdefault(entry["row"], []).append(entry)
+        row = entry.get("row")
+        col = entry.get("col")
+        if row is None:
+            continue
+        if row not in anycol_row_map:
+            anycol_row_map[row] = entry
+        if (col == image_col or image_col is None) and row not in strict_row_map:
+            strict_row_map[row] = entry
 
     mapped = []
-    used_entry_ids = set()
-    unassigned_rows = []
-
-    # Step 1: strict row (with inferred global offset) matching.
-    for row_idx in target_rows_sorted:
-        candidate_row = row_idx + best_offset
-        bucket = row_buckets.get(candidate_row, [])
-        entry = None
-        while bucket:
-            candidate = bucket.pop(0)
-            cid = id(candidate)
-            if cid not in used_entry_ids:
-                used_entry_ids.add(cid)
-                entry = candidate
-                break
+    for row_idx in sorted(target_rows):
+        entry = strict_row_map.get(row_idx)
         if entry is not None:
             mapped.append((row_idx, entry))
-            if entry.get("row") == row_idx:
-                diagnostics["exact_row_matches"] += 1
-        else:
-            unassigned_rows.append(row_idx)
-
-    # Step 2: assign remaining rows to remaining unused entries in order.
-    remaining_entries = [entry for entry in row_entries if id(entry) not in used_entry_ids]
-    remaining_entries.extend(no_row_entries)
-    assign_count = min(len(unassigned_rows), len(remaining_entries))
-    for idx in range(assign_count):
-        row_idx = unassigned_rows[idx]
-        entry = remaining_entries[idx]
-        used_entry_ids.add(id(entry))
-        mapped.append((row_idx, entry))
-        if entry.get("row") == row_idx:
             diagnostics["exact_row_matches"] += 1
-    unassigned_rows = unassigned_rows[assign_count:]
+            diagnostics["strict_col_matches"] += 1
+            continue
 
-    # Step 3: if still rows remain, distribute nearest repeats by position.
-    if unassigned_rows:
-        source_pool = [entry for _, entry in sorted(mapped, key=lambda x: x[0])]
-        if not source_pool:
-            source_pool = row_entries or no_row_entries
-        pool_with_rows = [entry for entry in source_pool if entry.get("row") is not None]
-        for idx, row_idx in enumerate(unassigned_rows):
-            if pool_with_rows:
-                chosen = min(
-                    pool_with_rows,
-                    key=lambda item: (abs(item["row"] - row_idx), item["row"]),
-                )
-            elif len(source_pool) == 1:
-                chosen = source_pool[0]
-            else:
-                ratio = float(idx) / float(max(1, len(unassigned_rows) - 1))
-                pool_index = int(round(ratio * (len(source_pool) - 1)))
-                chosen = source_pool[pool_index]
-            mapped.append((row_idx, chosen))
-            if chosen.get("row") == row_idx:
-                diagnostics["exact_row_matches"] += 1
+        entry = anycol_row_map.get(row_idx)
+        if entry is not None:
+            mapped.append((row_idx, entry))
+            diagnostics["exact_row_matches"] += 1
+            continue
 
-    mapped.sort(key=lambda pair: pair[0])
-    diagnostics["strategy"] = "offset_then_ordered_then_repeat"
+        diagnostics["missing_rows"].append(row_idx)
+
+    if diagnostics["missing_rows"]:
+        diagnostics["strategy"] = "strict_same_row_partial"
     return mapped, diagnostics
 
 
@@ -877,9 +823,9 @@ def extract_images():
     upscaled_count = 0
     mapping_info = {
         "strategy": "none",
-        "best_offset": 0,
-        "offset_match_count": 0,
         "exact_row_matches": 0,
+        "strict_col_matches": 0,
+        "missing_rows": [],
     }
 
     excel_name_no_ext = Path(original_filename).stem if original_filename else "Excel_Images"
@@ -906,18 +852,6 @@ def extract_images():
             elif openpyxl_entries:
                 source_entries = openpyxl_entries
                 extraction_mode = "openpyxl_anchor"
-            elif media_images:
-                source_entries = [
-                    {
-                        "row": None,
-                        "col": image_col,
-                        "ext": media["ext"],
-                        "data": media["data"],
-                        "source": media["source"],
-                    }
-                    for media in media_images
-                ]
-                extraction_mode = "xlsx_media_fallback"
 
             image_cache = {}
 
@@ -929,9 +863,9 @@ def extract_images():
                 image_cache[cache_key] = (new_data, new_ext, did_upscale)
                 return image_cache[cache_key]
 
-            # Primary behavior requested: one output image per vendor/material row.
+            # Strict behavior requested: same row only (vendor row Dn -> image row An).
             if source_entries and target_rows:
-                mapped_rows, mapping_info = _assign_entries_to_rows(target_rows, source_entries)
+                mapped_rows, mapping_info = _assign_entries_to_rows(target_rows, source_entries, image_col)
                 for row_idx, entry in mapped_rows:
                     safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
                     if not safe_code:
@@ -949,19 +883,65 @@ def extract_images():
                     zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                     extracted_count += 1
 
-                if len(mapped_rows) != len(target_rows):
-                    skipped_count += abs(len(target_rows) - len(mapped_rows))
+                missing_rows = mapping_info.get("missing_rows") or []
+                if missing_rows:
+                    skipped_count += len(missing_rows)
+                    preview = ",".join(str(r) for r in missing_rows[:20])
                     skipped_reasons.append(
-                        "Target rows ({0}) and mapped images ({1}) mismatch.".format(
-                            len(target_rows), len(mapped_rows)
+                        "Strict same-row mapping missing image rows: {0}{1}".format(
+                            preview,
+                            "..." if len(missing_rows) > 20 else "",
                         )
                     )
+
+            # Strict fallback: only allow media sequential mapping when counts are exactly equal.
+            elif target_rows and media_images and len(media_images) == len(target_rows):
+                extraction_mode = "xlsx_media_fallback_equal_count_only"
+                mapping_info["strategy"] = "sequential_equal_count_only"
+                for idx, row_idx in enumerate(sorted(target_rows)):
+                    media = media_images[idx]
+                    safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
+                    if not safe_code:
+                        safe_code = "Row_{0}".format(row_idx)
+                    if code_source == "material":
+                        skipped_reasons.append(
+                            "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                        )
+                    out_data, out_ext, did_upscale = _maybe_upscale_image(media["data"], media["ext"], scale_factor=3)
+                    if did_upscale:
+                        upscaled_count += 1
+                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                    extracted_count += 1
+                mapping_info["exact_row_matches"] = len(target_rows)
+                mapping_info["strict_col_matches"] = len(target_rows)
+                mapping_info["missing_rows"] = []
+
+            elif target_rows and media_images and len(media_images) != len(target_rows):
+                extraction_mode = "strict_row_map_failed_media_count_mismatch"
+                skipped_count += len(target_rows)
+                skipped_reasons.append(
+                    "Strict mapping blocked fallback because media count ({0}) != vendor/material row count ({1}).".format(
+                        len(media_images), len(target_rows)
+                    )
+                )
 
             # If no vendor/material rows were found, still export discovered images.
             elif source_entries:
                 for idx, entry in enumerate(source_entries, start=1):
                     safe_code = "Image_{0}".format(idx)
                     out_data, out_ext, did_upscale = _prepared_image(entry)
+                    if did_upscale:
+                        upscaled_count += 1
+                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                    extracted_count += 1
+
+            elif media_images and not target_rows:
+                extraction_mode = "xlsx_media_no_target_rows"
+                for idx, media in enumerate(media_images, start=1):
+                    safe_code = "Image_{0}".format(idx)
+                    out_data, out_ext, did_upscale = _maybe_upscale_image(media["data"], media["ext"], scale_factor=3)
                     if did_upscale:
                         upscaled_count += 1
                     filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
@@ -995,15 +975,17 @@ def extract_images():
                 "XLSX media items: {0}".format(len(media_images)),
                 "Upscaled images (3x): {0}".format(upscaled_count),
                 "Mapping strategy: {0}".format(mapping_info.get("strategy")),
-                "Mapping best row offset: {0}".format(mapping_info.get("best_offset")),
-                "Mapping offset matches: {0}".format(mapping_info.get("offset_match_count")),
                 "Mapping exact row matches: {0}".format(mapping_info.get("exact_row_matches")),
+                "Mapping strict image-column matches: {0}".format(mapping_info.get("strict_col_matches")),
+                "Mapping missing rows: {0}".format(len(mapping_info.get("missing_rows") or [])),
                 "Extracted images: {0}".format(extracted_count),
                 "Skipped images: {0}".format(skipped_count),
                 "",
                 "Rules:",
+                "- Strict same-row mapping: vendor/material row N uses image row N.",
                 "- Row mapping starts after detected header rows.",
-                "- One output file per vendor/material row when rows are detected.",
+                "- No nearest-row guessing and no offset guessing.",
+                "- If strict row mapping is incomplete, missing rows are reported in summary.",
                 "- Preferred name is Vendor Material from detected vendor column.",
                 "- If Vendor is empty and Original Material exists, file uses MAT_<material>.",
                 "",
@@ -1028,8 +1010,13 @@ def extract_images():
             os.remove(zip_path)
         except OSError:
             pass
+        error_message = (
+            skipped_reasons[0]
+            if skipped_reasons
+            else "No images were extracted. Ensure images are in Column A and not empty."
+        )
         return _json_error(
-            "No images were extracted. Ensure images are in Column A and not empty.",
+            error_message,
             400,
         )
 
