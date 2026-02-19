@@ -524,28 +524,32 @@ def _find_cellimages_part_path(archive):
     return None
 
 
-def _extract_cellimages_by_key(archive, cellimages_path):
+def _extract_cellimages_by_key(archive, cellimages_path, expected_keys):
     rels_path = "{0}/_rels/{1}.rels".format(
         posixpath.dirname(cellimages_path),
         posixpath.basename(cellimages_path),
     )
     rels_map = _read_relationships(archive, rels_path)
     root = ET.fromstring(archive.read(cellimages_path))
+    expected_norm_keys = {
+        _normalize_mapping_key(key) for key in (expected_keys or []) if _normalize_mapping_key(key)
+    }
     images_by_key = {}
-    ordered_images = []
-    seen_source = set()
+    record_cache = {}
 
-    for node in root.iter():
-        # Heuristic: picture-like nodes
-        local = _xml_local_name(node.tag).lower()
-        if local not in {"pic", "cellimage", "image", "onecellanchor", "twocellanchor"}:
-            continue
+    # Prefer picture nodes first for tighter key-to-media extraction.
+    pic_nodes = [node for node in root.iter() if _xml_local_name(node.tag).lower() == "pic"]
+    candidate_nodes = pic_nodes or [
+        node
+        for node in root.iter()
+        if _xml_local_name(node.tag).lower() in {"cellimage", "image", "onecellanchor", "twocellanchor"}
+    ]
 
+    for node in candidate_nodes:
         rel_ids = []
         for sub in node.iter():
             for attr_name, attr_value in sub.attrib.items():
-                attr_local = _xml_local_name(attr_name).lower()
-                if attr_local == "embed" and attr_value:
+                if _xml_local_name(attr_name).lower() == "embed" and attr_value:
                     rel_ids.append(attr_value)
 
         media_path = None
@@ -564,34 +568,34 @@ def _extract_cellimages_by_key(archive, cellimages_path):
         if not media_path or data is None:
             continue
 
-        key_candidates = []
+        matched_keys = set()
         for sub in node.iter():
-            for attr_name, attr_value in sub.attrib.items():
-                attr_local = _xml_local_name(attr_name).lower()
-                if attr_local in {"name", "id", "title", "descr"} and attr_value:
-                    key_candidates.append(str(attr_value).strip())
-            if sub.text:
-                txt = sub.text.strip()
-                if txt and txt.upper().startswith("ID_"):
-                    key_candidates.append(txt)
+            for attr_value in sub.attrib.values():
+                norm = _normalize_mapping_key(str(attr_value))
+                if norm and norm in expected_norm_keys:
+                    matched_keys.add(norm)
+            text_value = (sub.text or "").strip()
+            if text_value:
+                norm = _normalize_mapping_key(text_value)
+                if norm and norm in expected_norm_keys:
+                    matched_keys.add(norm)
 
-        record = {
-            "data": data,
-            "ext": ext or "png",
-            "source": "cellimages:{0}".format(media_path),
-        }
+        if len(matched_keys) != 1:
+            # Accuracy-first mode: skip ambiguous or key-less nodes.
+            continue
 
-        if media_path not in seen_source:
-            ordered_images.append(record)
-            seen_source.add(media_path)
+        key_norm = next(iter(matched_keys))
+        record = record_cache.get(media_path)
+        if record is None:
+            record = {
+                "data": data,
+                "ext": ext or "png",
+                "source": "cellimages:{0}".format(media_path),
+            }
+            record_cache[media_path] = record
+        images_by_key[key_norm] = record
 
-        for key_name in key_candidates:
-            norm = _normalize_mapping_key(key_name)
-            if not norm:
-                continue
-            images_by_key[norm] = record
-
-    return images_by_key, ordered_images
+    return images_by_key
 
 
 def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
@@ -607,26 +611,14 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
         cellimages_path = _find_cellimages_part_path(archive)
         if not cellimages_path:
             return entries
-        images_by_key, ordered_images = _extract_cellimages_by_key(archive, cellimages_path)
-        if not images_by_key and not ordered_images:
+        expected_keys = {_normalize_mapping_key(value) for value in row_key_map.values() if value}
+        images_by_key = _extract_cellimages_by_key(archive, cellimages_path, expected_keys)
+        if not images_by_key:
             return entries
-
-        # Fallback by first-appearance order if direct key lookup fails.
-        ordered_unique_keys = []
-        seen_keys = set()
-        for row_idx in sorted(row_key_map.keys()):
-            norm = _normalize_mapping_key(row_key_map[row_idx])
-            if norm and norm not in seen_keys:
-                ordered_unique_keys.append(norm)
-                seen_keys.add(norm)
-        order_key_to_image = {}
-        for idx, norm_key in enumerate(ordered_unique_keys):
-            if idx < len(ordered_images):
-                order_key_to_image[norm_key] = ordered_images[idx]
 
         for row_idx in sorted(row_key_map.keys()):
             norm_key = _normalize_mapping_key(row_key_map[row_idx])
-            image_item = images_by_key.get(norm_key) or order_key_to_image.get(norm_key)
+            image_item = images_by_key.get(norm_key)
             if not image_item:
                 continue
             entries.append(
@@ -892,62 +884,24 @@ def extract_images():
                         )
                     )
 
-            # Strict fallback: only allow media sequential mapping when counts are exactly equal.
-            elif target_rows and media_images and len(media_images) == len(target_rows):
-                extraction_mode = "xlsx_media_fallback_equal_count_only"
-                mapping_info["strategy"] = "sequential_equal_count_only"
-                for idx, row_idx in enumerate(sorted(target_rows)):
-                    media = media_images[idx]
-                    safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                    if not safe_code:
-                        safe_code = "Row_{0}".format(row_idx)
-                    if code_source == "material":
-                        skipped_reasons.append(
-                            "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
-                        )
-                    out_data, out_ext, did_upscale = _maybe_upscale_image(media["data"], media["ext"], scale_factor=3)
-                    if did_upscale:
-                        upscaled_count += 1
-                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
-                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
-                    extracted_count += 1
-                mapping_info["exact_row_matches"] = len(target_rows)
-                mapping_info["strict_col_matches"] = len(target_rows)
-                mapping_info["missing_rows"] = []
-
-            elif target_rows and media_images and len(media_images) != len(target_rows):
-                # Prefer DISPIMG row-key mapping first: row N in column A keeps its own formula key,
-                # then repeated keys share the same media payload.
-                row_key_map = {}
-                for row_idx in sorted(target_rows):
-                    norm_key = _normalize_mapping_key(dispimg_row_keys.get(row_idx))
-                    if norm_key:
-                        row_key_map[row_idx] = norm_key
-
-                if row_key_map:
-                    extraction_mode = "dispimg_key_media_fallback"
-                    mapping_info["strategy"] = "dispimg_key_media_fallback"
-
-                    key_to_media = {}
-                    media_ptr = 0
-                    unresolved_rows = []
-
-                    for row_idx in sorted(target_rows):
-                        norm_key = row_key_map.get(row_idx)
-                        if not norm_key:
-                            unresolved_rows.append(row_idx)
-                            continue
-
-                        media = key_to_media.get(norm_key)
-                        if media is None:
-                            if media_ptr < len(media_images):
-                                media = media_images[media_ptr]
-                                key_to_media[norm_key] = media
-                                media_ptr += 1
-                            else:
-                                unresolved_rows.append(row_idx)
-                                continue
-
+            elif target_rows and media_images:
+                # Accuracy-first rule:
+                # if DISPIMG formulas exist but we could not build deterministic key->image mapping,
+                # do not guess from media order.
+                if dispimg_row_keys:
+                    extraction_mode = "blocked_ambiguous_dispimg_media"
+                    mapping_info["strategy"] = "blocked_ambiguous_dispimg_media"
+                    mapping_info["missing_rows"] = sorted(target_rows)
+                    skipped_count += len(target_rows)
+                    skipped_reasons.append(
+                        "Found DISPIMG formulas in Column A, but deterministic formula-ID to media mapping was incomplete. "
+                        "Heuristic media fallback is disabled to protect naming accuracy."
+                    )
+                elif len(media_images) == len(target_rows):
+                    extraction_mode = "xlsx_media_fallback_equal_count_only"
+                    mapping_info["strategy"] = "sequential_equal_count_only"
+                    for idx, row_idx in enumerate(sorted(target_rows)):
+                        media = media_images[idx]
                         safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
                         if not safe_code:
                             safe_code = "Row_{0}".format(row_idx)
@@ -955,34 +909,17 @@ def extract_images():
                             skipped_reasons.append(
                                 "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
                             )
-
                         out_data, out_ext, did_upscale = _maybe_upscale_image(
                             media["data"], media["ext"], scale_factor=3
                         )
                         if did_upscale:
                             upscaled_count += 1
-
                         filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
                         zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                         extracted_count += 1
-
-                    mapping_info["exact_row_matches"] = extracted_count
-                    mapping_info["strict_col_matches"] = extracted_count
-                    mapping_info["missing_rows"] = unresolved_rows
-                    if unresolved_rows:
-                        skipped_count += len(unresolved_rows)
-                        preview = ",".join(str(r) for r in unresolved_rows[:20])
-                        skipped_reasons.append(
-                            "DISPIMG row-key fallback could not map rows: {0}{1}".format(
-                                preview,
-                                "..." if len(unresolved_rows) > 20 else "",
-                            )
-                        )
-                    skipped_reasons.append(
-                        "Counts differ (media={0}, rows={1}); used DISPIMG row keys to preserve row-level mapping.".format(
-                            len(media_images), len(target_rows)
-                        )
-                    )
+                    mapping_info["exact_row_matches"] = len(target_rows)
+                    mapping_info["strict_col_matches"] = len(target_rows)
+                    mapping_info["missing_rows"] = []
                 else:
                     extraction_mode = "code_grouped_media_fallback"
                     mapping_info["strategy"] = "code_grouped_media_fallback"
