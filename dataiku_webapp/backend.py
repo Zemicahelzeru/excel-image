@@ -26,6 +26,9 @@ except NameError:
 
 ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
+FIXED_IMAGE_COL = 1  # Column A
+FIXED_VENDOR_COL = 4  # Column D
+FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
 
 
 def _json_error(message, status_code=400):
@@ -219,42 +222,37 @@ def _detect_material_column(ws, vendor_col):
 
 
 def _detect_layout(ws):
-    max_row = min(ws.max_row or 1, 60)
-    max_col = min(ws.max_column or 1, 40)
-    image_header = None
-    vendor_header = None
-    material_header = None
+    max_row = min(ws.max_row or 1, 120)
+    image_header_row = None
+    vendor_header_row = None
+    material_header_row = None
 
+    # Strict fixed-column mode requested by user:
+    # Image must be in A, vendor must be in D, optional material fallback in F.
     for row_idx in range(1, max_row + 1):
-        for col_idx in range(1, max_col + 1):
-            label = _normalize_label(ws.cell(row_idx, col_idx).value)
-            if not label:
-                continue
-            if image_header is None and _is_image_header_label(label):
-                image_header = (row_idx, col_idx)
-            if vendor_header is None and _is_vendor_header_label(label):
-                vendor_header = (row_idx, col_idx)
-            if material_header is None and _is_material_header_label(label):
-                material_header = (row_idx, col_idx)
+        image_label = _normalize_label(ws.cell(row_idx, FIXED_IMAGE_COL).value)
+        vendor_label = _normalize_label(ws.cell(row_idx, FIXED_VENDOR_COL).value)
+        material_label = _normalize_label(ws.cell(row_idx, FIXED_MATERIAL_COL).value)
 
-    image_col = image_header[1] if image_header else 1
-    vendor_col = vendor_header[1] if vendor_header else _detect_vendor_column(ws)
-    material_col = material_header[1] if material_header else _detect_material_column(ws, vendor_col)
+        if image_header_row is None and _is_image_header_label(image_label):
+            image_header_row = row_idx
+        if vendor_header_row is None and _is_vendor_header_label(vendor_label):
+            vendor_header_row = row_idx
+        if material_header_row is None and _is_material_header_label(material_label):
+            material_header_row = row_idx
 
-    header_rows = []
-    for header in (image_header, vendor_header, material_header):
-        if header is not None:
-            header_rows.append(header[0])
+    header_rows = [r for r in (image_header_row, vendor_header_row, material_header_row) if r is not None]
     start_row = max(header_rows) + 1 if header_rows else 2
 
+    material_col = FIXED_MATERIAL_COL if (ws.max_column or 0) >= FIXED_MATERIAL_COL else None
     return {
-        "image_col": image_col,
-        "vendor_col": vendor_col,
+        "image_col": FIXED_IMAGE_COL,
+        "vendor_col": FIXED_VENDOR_COL,
         "material_col": material_col,
         "start_row": start_row,
-        "image_header_row": image_header[0] if image_header else None,
-        "vendor_header_row": vendor_header[0] if vendor_header else None,
-        "material_header_row": material_header[0] if material_header else None,
+        "image_header_row": image_header_row,
+        "vendor_header_row": vendor_header_row,
+        "material_header_row": material_header_row,
     }
 
 
@@ -672,14 +670,11 @@ def _assign_entries_to_rows(target_rows, entries, image_col):
         return [], diagnostics
 
     strict_row_map = {}
-    anycol_row_map = {}
     for entry in row_entries:
         row = entry.get("row")
         col = entry.get("col")
         if row is None:
             continue
-        if row not in anycol_row_map:
-            anycol_row_map[row] = entry
         if (col == image_col or image_col is None) and row not in strict_row_map:
             strict_row_map[row] = entry
 
@@ -690,12 +685,6 @@ def _assign_entries_to_rows(target_rows, entries, image_col):
             mapped.append((row_idx, entry))
             diagnostics["exact_row_matches"] += 1
             diagnostics["strict_col_matches"] += 1
-            continue
-
-        entry = anycol_row_map.get(row_idx)
-        if entry is not None:
-            mapped.append((row_idx, entry))
-            diagnostics["exact_row_matches"] += 1
             continue
 
         diagnostics["missing_rows"].append(row_idx)
