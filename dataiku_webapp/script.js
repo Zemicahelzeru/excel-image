@@ -184,14 +184,25 @@
               throw new Error(message);
             });
           }
-          return response.blob();
+          const contentDisposition = response.headers.get("Content-Disposition") || "";
+          const filenameMatch = contentDisposition.match(/filename\*?=(?:UTF-8''|")?([^\";]+)/i);
+          const filename = filenameMatch ? decodeURIComponent(filenameMatch[1]).replace(/"/g, "") : "";
+          return response.blob().then(function (blob) {
+            return { blob: blob, filename: filename };
+          });
         }
       );
     }
 
-    function buildDownloadName() {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      return "Excel_Images_" + timestamp + ".zip";
+    function buildDownloadName(excelFilename, backendFilename) {
+      if (backendFilename) {
+        return backendFilename;
+      }
+      if (!excelFilename) {
+        return "Excel_Images.zip";
+      }
+      const base = excelFilename.replace(/\.(xlsx|xlsm)$/i, "");
+      return base + ".zip";
     }
 
     function runHealthCheck() {
@@ -288,11 +299,11 @@
       showStatus("Processing images...", "info");
 
       extractImages(formData)
-        .then(function (blob) {
-          const url = window.URL.createObjectURL(blob);
+        .then(function (result) {
+          const url = window.URL.createObjectURL(result.blob);
           const anchor = document.createElement("a");
           anchor.href = url;
-          anchor.download = buildDownloadName();
+          anchor.download = buildDownloadName(file.name, result.filename);
           document.body.appendChild(anchor);
           anchor.click();
           document.body.removeChild(anchor);
