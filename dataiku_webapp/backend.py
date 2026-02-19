@@ -12,6 +12,11 @@ import openpyxl
 from flask import Flask, after_this_request, jsonify, request, send_file
 from werkzeug.exceptions import HTTPException
 
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
+
 # In Dataiku webapps, "app" is usually already provided.
 # This fallback keeps the file runnable outside Dataiku for local testing.
 try:
@@ -441,6 +446,188 @@ def _extract_openpyxl_images(images):
     return entries
 
 
+def _cell_ref_to_row_col(cell_ref):
+    match = re.match(r"^([A-Za-z]+)(\d+)$", cell_ref or "")
+    if not match:
+        return None, None
+    col_letters = match.group(1).upper()
+    row_idx = int(match.group(2))
+    col_idx = 0
+    for ch in col_letters:
+        col_idx = col_idx * 26 + (ord(ch) - ord("A") + 1)
+    return row_idx, col_idx
+
+
+def _extract_dispimg_row_map(archive, sheet_path, image_col, start_row):
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    row_map = {}
+    sheet_root = ET.fromstring(archive.read(sheet_path))
+    for cell in sheet_root.findall(".//main:c", ns):
+        cell_ref = cell.attrib.get("r")
+        row_idx, col_idx = _cell_ref_to_row_col(cell_ref)
+        if row_idx is None or col_idx is None:
+            continue
+        if col_idx != image_col or row_idx < start_row:
+            continue
+        formula = cell.findtext("main:f", default="", namespaces=ns) or ""
+        if "DISPIMG" not in formula.upper():
+            continue
+        key_match = re.search(r'DISPIMG\(\s*"([^"]+)"', formula, flags=re.IGNORECASE)
+        if not key_match:
+            key_match = re.search(r"DISPIMG\(\s*'([^']+)'", formula, flags=re.IGNORECASE)
+        if not key_match:
+            continue
+        key = key_match.group(1).strip()
+        if key:
+            row_map[row_idx] = key
+    return row_map
+
+
+def _find_cellimages_part_path(archive):
+    workbook_rels = _read_relationships(archive, "xl/_rels/workbook.xml.rels")
+    for target in workbook_rels.values():
+        if "cellimage" in target.lower():
+            part_path = _resolve_zip_path("xl/workbook.xml", target)
+            if part_path in archive.namelist():
+                return part_path
+
+    for candidate in ("xl/cellimages.xml", "xl/cellImages.xml"):
+        if candidate in archive.namelist():
+            return candidate
+    return None
+
+
+def _extract_cellimages_by_key(archive, cellimages_path):
+    ns = {
+        "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
+    rels_path = "{0}/_rels/{1}.rels".format(
+        posixpath.dirname(cellimages_path),
+        posixpath.basename(cellimages_path),
+    )
+    rels_map = _read_relationships(archive, rels_path)
+    root = ET.fromstring(archive.read(cellimages_path))
+    images_by_key = {}
+
+    for pic in root.findall(".//xdr:pic", ns):
+        c_nv_pr = pic.find(".//xdr:cNvPr", ns)
+        if c_nv_pr is None:
+            continue
+        key_name = (c_nv_pr.attrib.get("name") or "").strip()
+        if not key_name:
+            continue
+        blip = pic.find(".//a:blip", ns)
+        if blip is None:
+            continue
+        rel_id = blip.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
+        target = rels_map.get(rel_id)
+        media_path = _resolve_zip_path(cellimages_path, target)
+        if not media_path or media_path not in archive.namelist():
+            continue
+        data = archive.read(media_path)
+        if not data:
+            continue
+        item = {
+            "data": data,
+            "ext": _normalize_ext(Path(media_path).suffix, data),
+            "source": "cellimages:{0}".format(key_name),
+        }
+        images_by_key[key_name] = item
+        images_by_key[key_name.upper()] = item
+    return images_by_key
+
+
+def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
+    entries = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
+        sheet_path = _sheet_path_for_name(archive, sheet_name)
+        if not sheet_path or sheet_path not in archive.namelist():
+            return entries
+        row_key_map = _extract_dispimg_row_map(archive, sheet_path, image_col, start_row)
+        if not row_key_map:
+            return entries
+
+        cellimages_path = _find_cellimages_part_path(archive)
+        if not cellimages_path:
+            return entries
+        images_by_key = _extract_cellimages_by_key(archive, cellimages_path)
+        if not images_by_key:
+            return entries
+
+        for row_idx in sorted(row_key_map.keys()):
+            key = row_key_map[row_idx]
+            image_item = images_by_key.get(key) or images_by_key.get(key.upper())
+            if not image_item:
+                continue
+            entries.append(
+                {
+                    "row": row_idx,
+                    "col": image_col,
+                    "ext": image_item["ext"],
+                    "data": image_item["data"],
+                    "source": "dispimg:{0}".format(key),
+                }
+            )
+    return entries
+
+
+def _collect_target_rows(ws, start_row, vendor_col, material_col):
+    rows = []
+    max_row = ws.max_row or start_row
+    for row_idx in range(start_row, max_row + 1):
+        code, _ = _row_code(ws, row_idx, vendor_col, material_col)
+        if code:
+            rows.append(row_idx)
+    return rows
+
+
+def _assign_entries_to_rows(target_rows, entries):
+    if not target_rows or not entries:
+        return []
+
+    row_entries = [entry for entry in entries if entry.get("row") is not None]
+    no_row_entries = [entry for entry in entries if entry.get("row") is None]
+
+    if not row_entries:
+        mapped = []
+        for idx, row_idx in enumerate(target_rows):
+            mapped.append((row_idx, no_row_entries[idx % len(no_row_entries)]))
+        return mapped
+
+    row_entries.sort(key=lambda item: item["row"])
+    mapped = []
+    pointer = 0
+    current = row_entries[0]
+
+    for row_idx in sorted(target_rows):
+        while pointer + 1 < len(row_entries) and row_entries[pointer + 1]["row"] <= row_idx:
+            pointer += 1
+            current = row_entries[pointer]
+        mapped.append((row_idx, current))
+    return mapped
+
+
+def _maybe_upscale_image(data, ext, scale_factor=3):
+    if Image is None:
+        return data, ext, False
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            # Upscale only when image is visually small.
+            if max(img.size) >= 300:
+                return data, ext, False
+
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+            resized = img.resize((img.width * scale_factor, img.height * scale_factor), resampling)
+            output = io.BytesIO()
+            # Save as PNG to avoid additional quality loss from JPEG re-encoding.
+            resized.save(output, format="PNG")
+            return output.getvalue(), "png", True
+    except Exception:
+        return data, ext, False
+
+
 def _extract_media_images(file_bytes):
     media = []
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
@@ -523,16 +710,20 @@ def extract_images():
     vendor_col = layout["vendor_col"]
     material_col = layout["material_col"]
     start_row = layout["start_row"]
+    target_rows = _collect_target_rows(ws, start_row, vendor_col, material_col)
 
     openpyxl_images = list(getattr(ws, "_images", []) or [])
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
     drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name)
+    dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
+    media_images = _extract_media_images(file_bytes)
 
     extracted_count = 0
     skipped_count = 0
     skipped_reasons = []
     seen_filenames = set()
     extraction_mode = "none"
+    upscaled_count = 0
 
     excel_name_no_ext = Path(original_filename).stem if original_filename else "Excel_Images"
     root_folder = _safe_folder_name(excel_name_no_ext)
@@ -548,74 +739,85 @@ def extract_images():
 
     try:
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-            row_based_entries = drawing_entries if drawing_entries else openpyxl_entries
-            if row_based_entries:
-                extraction_mode = "drawing_anchor" if drawing_entries else "openpyxl_anchor"
-
-                entries_after_start = [
-                    entry
-                    for entry in row_based_entries
-                    if entry.get("row") is None or entry.get("row") >= start_row
+            source_entries = []
+            if dispimg_entries:
+                source_entries = dispimg_entries
+                extraction_mode = "dispimg_cellimages"
+            elif drawing_entries:
+                source_entries = drawing_entries
+                extraction_mode = "drawing_anchor"
+            elif openpyxl_entries:
+                source_entries = openpyxl_entries
+                extraction_mode = "openpyxl_anchor"
+            elif media_images:
+                source_entries = [
+                    {
+                        "row": None,
+                        "col": image_col,
+                        "ext": media["ext"],
+                        "data": media["data"],
+                        "source": media["source"],
+                    }
+                    for media in media_images
                 ]
-                if entries_after_start:
-                    col_entries = [
-                        entry for entry in entries_after_start if entry.get("col") == image_col
-                    ]
-                    if col_entries:
-                        row_based_entries = col_entries
-                        extraction_mode += "_image_col"
-                    else:
-                        row_based_entries = entries_after_start
-                        extraction_mode += "_any_col"
+                extraction_mode = "xlsx_media_fallback"
 
-                for idx, entry in enumerate(row_based_entries, start=1):
-                    row = entry.get("row")
-                    safe_code, code_source = (None, None)
-                    if row is not None:
-                        safe_code, code_source = _row_code(ws, row, vendor_col, material_col)
+            image_cache = {}
+
+            def _prepared_image(entry):
+                cache_key = entry.get("source") or id(entry)
+                if cache_key in image_cache:
+                    return image_cache[cache_key]
+                new_data, new_ext, did_upscale = _maybe_upscale_image(entry["data"], entry["ext"], scale_factor=3)
+                image_cache[cache_key] = (new_data, new_ext, did_upscale)
+                return image_cache[cache_key]
+
+            # Primary behavior requested: one output image per vendor/material row.
+            if source_entries and target_rows:
+                mapped_rows = _assign_entries_to_rows(target_rows, source_entries)
+                for row_idx, entry in mapped_rows:
+                    safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
                     if not safe_code:
-                        safe_code = "Row_{0}".format(row) if row is not None else "Image_{0}".format(idx)
+                        safe_code = "Row_{0}".format(row_idx)
                     if code_source == "material":
                         skipped_reasons.append(
-                            "Row {0}: vendor missing, used material fallback.".format(row)
+                            "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
                         )
-                    filename = _next_unique_filename(safe_code, entry["ext"], seen_filenames)
-                    zip_file.writestr("{0}/{1}".format(root_folder, filename), entry["data"])
+
+                    out_data, out_ext, did_upscale = _prepared_image(entry)
+                    if did_upscale:
+                        upscaled_count += 1
+
+                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                     extracted_count += 1
 
-            # If anchor extraction yields nothing, fallback to media list.
-            if extracted_count == 0:
-                media_images = _extract_media_images(file_bytes)
-                if media_images:
-                    extraction_mode = "xlsx_media_fallback"
-                    row_candidates = _candidate_rows_for_media(
-                        ws,
-                        start_row=start_row,
-                        image_col=image_col,
-                        vendor_col=vendor_col,
-                        material_col=material_col,
-                    )
-                    for idx, media in enumerate(media_images, start=1):
-                        row = row_candidates[idx - 1] if idx - 1 < len(row_candidates) else None
-                        safe_code, code_source = (None, None)
-                        if row is not None:
-                            safe_code, code_source = _row_code(ws, row, vendor_col, material_col)
-                        if not safe_code:
-                            safe_code = "Row_{0}".format(row) if row is not None else "Image_{0}".format(idx)
-                        if code_source == "material":
-                            skipped_reasons.append(
-                                "Row {0}: vendor missing, used material fallback.".format(row)
-                            )
-                        filename = _next_unique_filename(safe_code, media["ext"], seen_filenames)
-                        zip_file.writestr("{0}/{1}".format(root_folder, filename), media["data"])
-                        extracted_count += 1
-
-                    if row_candidates and len(media_images) != len(row_candidates):
-                        skipped_reasons.append(
-                            "Media items ({0}) and detected data rows ({1}) count mismatch.".format(
-                                len(media_images), len(row_candidates)
-                            )
+                if len(mapped_rows) != len(target_rows):
+                    skipped_count += abs(len(target_rows) - len(mapped_rows))
+                    skipped_reasons.append(
+                        "Target rows ({0}) and mapped images ({1}) mismatch.".format(
+                            len(target_rows), len(mapped_rows)
                         )
+                    )
+
+            # If no vendor/material rows were found, still export discovered images.
+            elif source_entries:
+                for idx, entry in enumerate(source_entries, start=1):
+                    safe_code = "Image_{0}".format(idx)
+                    out_data, out_ext, did_upscale = _prepared_image(entry)
+                    if did_upscale:
+                        upscaled_count += 1
+                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                    extracted_count += 1
+
+            if target_rows and extracted_count and extracted_count != len(target_rows):
+                skipped_count += abs(len(target_rows) - extracted_count)
+                skipped_reasons.append(
+                    "Final count check failed: extracted {0}, vendor/material rows {1}.".format(
+                        extracted_count, len(target_rows)
+                    )
+                )
 
             summary_lines = [
                 "Excel Image Extraction Summary",
@@ -629,14 +831,18 @@ def extract_images():
                 "Detected vendor column: {0}".format(vendor_col),
                 "Detected material column: {0}".format(material_col or "none"),
                 "Data start row: {0}".format(start_row),
+                "Vendor/material target rows: {0}".format(len(target_rows)),
+                "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
                 "Openpyxl anchored images: {0}".format(len(openpyxl_entries)),
                 "Drawing anchored images: {0}".format(len(drawing_entries)),
-                "XLSX media items: {0}".format(len(_extract_media_images(file_bytes))),
+                "XLSX media items: {0}".format(len(media_images)),
+                "Upscaled images (3x): {0}".format(upscaled_count),
                 "Extracted images: {0}".format(extracted_count),
                 "Skipped images: {0}".format(skipped_count),
                 "",
                 "Rules:",
                 "- Row mapping starts after detected header rows.",
+                "- One output file per vendor/material row when rows are detected.",
                 "- Preferred name is Vendor Material from detected vendor column.",
                 "- If Vendor is empty and Original Material exists, file uses MAT_<material>.",
                 "",
