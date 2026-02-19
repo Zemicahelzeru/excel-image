@@ -641,6 +641,14 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
     return entries
 
 
+def _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row):
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
+        sheet_path = _sheet_path_for_name(archive, sheet_name)
+        if not sheet_path or sheet_path not in archive.namelist():
+            return {}
+        return _extract_dispimg_row_map(archive, sheet_path, image_col, start_row)
+
+
 def _collect_target_rows(ws, start_row, vendor_col, material_col):
     rows = []
     max_row = ws.max_row or start_row
@@ -802,6 +810,7 @@ def extract_images():
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
     drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name)
     dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
+    dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
     media_images = _extract_media_images(file_bytes)
 
     extracted_count = 0
@@ -907,61 +916,129 @@ def extract_images():
                 mapping_info["missing_rows"] = []
 
             elif target_rows and media_images and len(media_images) != len(target_rows):
-                extraction_mode = "code_grouped_media_fallback"
-                mapping_info["strategy"] = "code_grouped_media_fallback"
-
-                code_to_media = {}
-                media_ptr = 0
-                unresolved_rows = []
-
+                # Prefer DISPIMG row-key mapping first: row N in column A keeps its own formula key,
+                # then repeated keys share the same media payload.
+                row_key_map = {}
                 for row_idx in sorted(target_rows):
-                    safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                    if not safe_code:
-                        safe_code = "Row_{0}".format(row_idx)
-                    code_key = safe_code.upper()
+                    norm_key = _normalize_mapping_key(dispimg_row_keys.get(row_idx))
+                    if norm_key:
+                        row_key_map[row_idx] = norm_key
 
-                    media = code_to_media.get(code_key)
-                    if media is None:
-                        if media_ptr < len(media_images):
-                            media = media_images[media_ptr]
-                            code_to_media[code_key] = media
-                            media_ptr += 1
-                        else:
+                if row_key_map:
+                    extraction_mode = "dispimg_key_media_fallback"
+                    mapping_info["strategy"] = "dispimg_key_media_fallback"
+
+                    key_to_media = {}
+                    media_ptr = 0
+                    unresolved_rows = []
+
+                    for row_idx in sorted(target_rows):
+                        norm_key = row_key_map.get(row_idx)
+                        if not norm_key:
                             unresolved_rows.append(row_idx)
                             continue
 
-                    if code_source == "material":
+                        media = key_to_media.get(norm_key)
+                        if media is None:
+                            if media_ptr < len(media_images):
+                                media = media_images[media_ptr]
+                                key_to_media[norm_key] = media
+                                media_ptr += 1
+                            else:
+                                unresolved_rows.append(row_idx)
+                                continue
+
+                        safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
+                        if not safe_code:
+                            safe_code = "Row_{0}".format(row_idx)
+                        if code_source == "material":
+                            skipped_reasons.append(
+                                "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                            )
+
+                        out_data, out_ext, did_upscale = _maybe_upscale_image(
+                            media["data"], media["ext"], scale_factor=3
+                        )
+                        if did_upscale:
+                            upscaled_count += 1
+
+                        filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                        zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                        extracted_count += 1
+
+                    mapping_info["exact_row_matches"] = extracted_count
+                    mapping_info["strict_col_matches"] = extracted_count
+                    mapping_info["missing_rows"] = unresolved_rows
+                    if unresolved_rows:
+                        skipped_count += len(unresolved_rows)
+                        preview = ",".join(str(r) for r in unresolved_rows[:20])
                         skipped_reasons.append(
-                            "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                            "DISPIMG row-key fallback could not map rows: {0}{1}".format(
+                                preview,
+                                "..." if len(unresolved_rows) > 20 else "",
+                            )
                         )
-
-                    out_data, out_ext, did_upscale = _maybe_upscale_image(
-                        media["data"], media["ext"], scale_factor=3
-                    )
-                    if did_upscale:
-                        upscaled_count += 1
-
-                    filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
-                    zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
-                    extracted_count += 1
-
-                mapping_info["exact_row_matches"] = extracted_count
-                mapping_info["strict_col_matches"] = extracted_count
-                mapping_info["missing_rows"] = unresolved_rows
-                if unresolved_rows:
-                    skipped_count += len(unresolved_rows)
-                    preview = ",".join(str(r) for r in unresolved_rows[:20])
                     skipped_reasons.append(
-                        "Media exhausted while assigning unique vendor codes. Missing rows: {0}{1}".format(
-                            preview,
-                            "..." if len(unresolved_rows) > 20 else "",
+                        "Counts differ (media={0}, rows={1}); used DISPIMG row keys to preserve row-level mapping.".format(
+                            len(media_images), len(target_rows)
                         )
                     )
-                skipped_reasons.append(
-                    "Counts differ (media={0}, rows={1}); grouped fallback used same image for repeated vendor codes.".format(
-                        len(media_images), len(target_rows)
+                else:
+                    extraction_mode = "code_grouped_media_fallback"
+                    mapping_info["strategy"] = "code_grouped_media_fallback"
+
+                    code_to_media = {}
+                    media_ptr = 0
+                    unresolved_rows = []
+
+                    for row_idx in sorted(target_rows):
+                        safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
+                        if not safe_code:
+                            safe_code = "Row_{0}".format(row_idx)
+                        code_key = safe_code.upper()
+
+                        media = code_to_media.get(code_key)
+                        if media is None:
+                            if media_ptr < len(media_images):
+                                media = media_images[media_ptr]
+                                code_to_media[code_key] = media
+                                media_ptr += 1
+                            else:
+                                unresolved_rows.append(row_idx)
+                                continue
+
+                        if code_source == "material":
+                            skipped_reasons.append(
+                                "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                            )
+
+                        out_data, out_ext, did_upscale = _maybe_upscale_image(
+                            media["data"], media["ext"], scale_factor=3
+                        )
+                        if did_upscale:
+                            upscaled_count += 1
+
+                        filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
+                        zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                        extracted_count += 1
+
+                    mapping_info["exact_row_matches"] = extracted_count
+                    mapping_info["strict_col_matches"] = extracted_count
+                    mapping_info["missing_rows"] = unresolved_rows
+                    if unresolved_rows:
+                        skipped_count += len(unresolved_rows)
+                        preview = ",".join(str(r) for r in unresolved_rows[:20])
+                        skipped_reasons.append(
+                            "Media exhausted while assigning unique vendor codes. Missing rows: {0}{1}".format(
+                                preview,
+                                "..." if len(unresolved_rows) > 20 else "",
+                            )
+                        )
+                    skipped_reasons.append(
+                        "Counts differ (media={0}, rows={1}); grouped fallback used same image for repeated vendor codes.".format(
+                            len(media_images), len(target_rows)
+                        )
                     )
-                )
 
             # If no vendor/material rows were found, still export discovered images.
             elif source_entries:
@@ -1007,6 +1084,7 @@ def extract_images():
                 "Data start row: {0}".format(start_row),
                 "Vendor/material target rows: {0}".format(len(target_rows)),
                 "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
+                "DISPIMG formula rows in image column: {0}".format(len(dispimg_row_keys)),
                 "Openpyxl anchored images: {0}".format(len(openpyxl_entries)),
                 "Drawing anchored images: {0}".format(len(drawing_entries)),
                 "XLSX media items: {0}".format(len(media_images)),
