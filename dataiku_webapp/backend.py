@@ -246,8 +246,9 @@ def _detect_layout(ws):
     if vendor_header_row is not None:
         start_row = vendor_header_row + 1
     else:
-        header_rows = [r for r in (image_header_row, material_header_row) if r is not None]
-        start_row = (min(header_rows) + 1) if header_rows else 2
+        # If vendor header is not explicit, default to row 2 to avoid accidental
+        # offsets from random "image/material" words in data rows.
+        start_row = 2
 
     material_col = FIXED_MATERIAL_COL if (ws.max_column or 0) >= FIXED_MATERIAL_COL else None
     return {
@@ -450,8 +451,9 @@ def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row):
             lower = resolved.lower()
             if not lower.endswith(".xml"):
                 continue
-            if "drawing" in lower or "cellimage" in lower:
-                candidate_parts.append((rid, resolved))
+            # Parse any XML part related to the sheet because some workbooks
+            # store row-anchored images in non-standard part names.
+            candidate_parts.append((rid, resolved))
 
         seen = set()
         idx = 0
@@ -495,8 +497,6 @@ def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row):
                             col = int(part_text) + 1
 
                 if row is None:
-                    continue
-                if start_row and row < start_row:
                     continue
 
                 embed_rel = None
@@ -582,6 +582,16 @@ def _normalize_mapping_key(key):
     return (key or "").strip().upper()
 
 
+def _possible_mapping_keys(raw_value):
+    text = _normalize_mapping_key(raw_value)
+    if not text:
+        return set()
+    keys = {text}
+    # Excel can wrap DISPIMG keys with extra characters. Keep stable ID_* tokens too.
+    keys.update(re.findall(r"ID_[A-Z0-9_-]+", text))
+    return {item for item in keys if item}
+
+
 def _xml_local_name(tag):
     if "}" in tag:
         return tag.rsplit("}", 1)[-1]
@@ -599,7 +609,7 @@ def _extract_dispimg_row_map(archive, sheet_path, image_col, start_row):
         row_idx, col_idx = _cell_ref_to_row_col(cell_ref)
         if row_idx is None or col_idx is None:
             continue
-        if col_idx != image_col or row_idx < start_row:
+        if col_idx != image_col:
             continue
         f_node = cell.find("main:f", ns)
         formula = ""
@@ -617,22 +627,33 @@ def _extract_dispimg_row_map(archive, sheet_path, image_col, start_row):
     return row_map
 
 
-def _find_cellimages_part_path(archive):
+def _find_cellimages_part_paths(archive):
+    paths = []
+    seen = set()
+
+    def _add(path):
+        if path and path in archive.namelist() and path not in seen:
+            seen.add(path)
+            paths.append(path)
+
     workbook_rels = _read_relationships(archive, "xl/_rels/workbook.xml.rels")
     for target in workbook_rels.values():
         if "cellimage" in target.lower():
             part_path = _resolve_zip_path("xl/workbook.xml", target)
-            if part_path in archive.namelist():
-                return part_path
+            _add(part_path)
 
     for candidate in ("xl/cellimages.xml", "xl/cellImages.xml"):
-        if candidate in archive.namelist():
-            return candidate
+        _add(candidate)
     for name in archive.namelist():
         lower = name.lower()
         if lower.startswith("xl/") and lower.endswith(".xml") and "cell" in lower and "image" in lower:
-            return name
-    return None
+            _add(name)
+    return paths
+
+
+def _find_cellimages_part_path(archive):
+    paths = _find_cellimages_part_paths(archive)
+    return paths[0] if paths else None
 
 
 def _extract_cellimages_by_key(archive, cellimages_path, expected_keys):
@@ -650,7 +671,20 @@ def _extract_cellimages_by_key(archive, cellimages_path, expected_keys):
 
     # Prefer picture nodes first for tighter key-to-media extraction.
     pic_nodes = [node for node in root.iter() if _xml_local_name(node.tag).lower() == "pic"]
-    candidate_nodes = pic_nodes or [
+    embed_nodes = []
+    for node in root.iter():
+        has_embed = False
+        for sub in node.iter():
+            for attr_name, attr_value in sub.attrib.items():
+                if _xml_local_name(attr_name).lower() == "embed" and attr_value:
+                    has_embed = True
+                    break
+            if has_embed:
+                break
+        if has_embed:
+            embed_nodes.append(node)
+
+    candidate_nodes = pic_nodes or embed_nodes or [
         node
         for node in root.iter()
         if _xml_local_name(node.tag).lower() in {"cellimage", "image", "onecellanchor", "twocellanchor"}
@@ -682,14 +716,23 @@ def _extract_cellimages_by_key(archive, cellimages_path, expected_keys):
         matched_keys = set()
         for sub in node.iter():
             for attr_value in sub.attrib.values():
-                norm = _normalize_mapping_key(str(attr_value))
-                if norm and norm in expected_norm_keys:
-                    matched_keys.add(norm)
+                possible = _possible_mapping_keys(str(attr_value))
+                matched_keys.update(possible.intersection(expected_norm_keys))
             text_value = (sub.text or "").strip()
             if text_value:
-                norm = _normalize_mapping_key(text_value)
-                if norm and norm in expected_norm_keys:
-                    matched_keys.add(norm)
+                possible = _possible_mapping_keys(text_value)
+                matched_keys.update(possible.intersection(expected_norm_keys))
+
+        # Last strict attempt: key may be embedded in longer XML strings.
+        if not matched_keys:
+            try:
+                node_xml = _normalize_mapping_key(ET.tostring(node, encoding="unicode"))
+            except Exception:
+                node_xml = ""
+            if node_xml:
+                for expected_key in expected_norm_keys:
+                    if expected_key and expected_key in node_xml:
+                        matched_keys.add(expected_key)
 
         if len(matched_keys) != 1:
             # Accuracy-first mode: skip ambiguous or key-less nodes.
@@ -719,11 +762,17 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
         if not row_key_map:
             return entries
 
-        cellimages_path = _find_cellimages_part_path(archive)
-        if not cellimages_path:
+        cellimages_paths = _find_cellimages_part_paths(archive)
+        if not cellimages_paths:
             return entries
         expected_keys = {_normalize_mapping_key(value) for value in row_key_map.values() if value}
-        images_by_key = _extract_cellimages_by_key(archive, cellimages_path, expected_keys)
+        images_by_key = {}
+        for cellimages_path in cellimages_paths:
+            part_images = _extract_cellimages_by_key(archive, cellimages_path, expected_keys)
+            if part_images:
+                # Keep first-resolved media per key for deterministic behavior.
+                for key, image in part_images.items():
+                    images_by_key.setdefault(key, image)
         if not images_by_key:
             return entries
 
@@ -747,75 +796,74 @@ def _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row):
 def _extract_cellimages_anchor_entries(file_bytes, image_col, start_row):
     entries = []
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
-        cellimages_path = _find_cellimages_part_path(archive)
-        if not cellimages_path or cellimages_path not in archive.namelist():
+        cellimages_paths = _find_cellimages_part_paths(archive)
+        if not cellimages_paths:
             return entries
 
-        rels_path = "{0}/_rels/{1}.rels".format(
-            posixpath.dirname(cellimages_path),
-            posixpath.basename(cellimages_path),
-        )
-        rels_map = _read_relationships(archive, rels_path)
-        if not rels_map:
-            return entries
-
-        root = ET.fromstring(archive.read(cellimages_path))
         entry_idx = 0
-        for anchor in root.iter():
-            anchor_local = _xml_local_name(anchor.tag).lower()
-            if anchor_local not in {"onecellanchor", "twocellanchor"}:
-                continue
-
-            row = None
-            col = None
-            from_node = None
-            for child in anchor.iter():
-                if _xml_local_name(child.tag).lower() == "from":
-                    from_node = child
-                    break
-            if from_node is not None:
-                for part in from_node:
-                    part_name = _xml_local_name(part.tag).lower()
-                    part_text = (part.text or "").strip()
-                    if part_name == "row" and part_text.isdigit():
-                        row = int(part_text) + 1
-                    elif part_name == "col" and part_text.isdigit():
-                        col = int(part_text) + 1
-
-            if row is None:
-                continue
-            if start_row and row < start_row:
-                continue
-
-            embed_rel = None
-            for child in anchor.iter():
-                for attr_name, attr_value in child.attrib.items():
-                    if _xml_local_name(attr_name).lower() == "embed" and attr_value:
-                        embed_rel = attr_value
-                        break
-                if embed_rel:
-                    break
-            if not embed_rel:
-                continue
-
-            target = rels_map.get(embed_rel)
-            media_path = _resolve_zip_path(cellimages_path, target)
-            if not media_path or media_path not in archive.namelist():
-                continue
-            data = archive.read(media_path)
-            if not data:
-                continue
-
-            entry_idx += 1
-            entries.append(
-                {
-                    "row": row,
-                    "col": col,
-                    "ext": _normalize_ext(Path(media_path).suffix, data),
-                    "data": data,
-                    "source": "cellimages_anchor:{0}".format(entry_idx),
-                }
+        for cellimages_path in cellimages_paths:
+            rels_path = "{0}/_rels/{1}.rels".format(
+                posixpath.dirname(cellimages_path),
+                posixpath.basename(cellimages_path),
             )
+            rels_map = _read_relationships(archive, rels_path)
+            if not rels_map:
+                continue
+
+            root = ET.fromstring(archive.read(cellimages_path))
+            for anchor in root.iter():
+                anchor_local = _xml_local_name(anchor.tag).lower()
+                if anchor_local not in {"onecellanchor", "twocellanchor"}:
+                    continue
+
+                row = None
+                col = None
+                from_node = None
+                for child in anchor.iter():
+                    if _xml_local_name(child.tag).lower() == "from":
+                        from_node = child
+                        break
+                if from_node is not None:
+                    for part in from_node:
+                        part_name = _xml_local_name(part.tag).lower()
+                        part_text = (part.text or "").strip()
+                        if part_name == "row" and part_text.isdigit():
+                            row = int(part_text) + 1
+                        elif part_name == "col" and part_text.isdigit():
+                            col = int(part_text) + 1
+
+                if row is None:
+                    continue
+
+                embed_rel = None
+                for child in anchor.iter():
+                    for attr_name, attr_value in child.attrib.items():
+                        if _xml_local_name(attr_name).lower() == "embed" and attr_value:
+                            embed_rel = attr_value
+                            break
+                    if embed_rel:
+                        break
+                if not embed_rel:
+                    continue
+
+                target = rels_map.get(embed_rel)
+                media_path = _resolve_zip_path(cellimages_path, target)
+                if not media_path or media_path not in archive.namelist():
+                    continue
+                data = archive.read(media_path)
+                if not data:
+                    continue
+
+                entry_idx += 1
+                entries.append(
+                    {
+                        "row": row,
+                        "col": col,
+                        "ext": _normalize_ext(Path(media_path).suffix, data),
+                        "data": data,
+                        "source": "cellimages_anchor:{0}".format(entry_idx),
+                    }
+                )
 
     entries.sort(key=lambda item: (item.get("row") or 10**9, item.get("col") or 10**9, item["source"]))
     return entries
