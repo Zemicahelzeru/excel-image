@@ -456,7 +456,7 @@ def _extract_drawing_images_for_sheet(file_bytes, sheet_name, ws=None):
     return entries
 
 
-def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row):
+def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row, ws=None):
     entries = []
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
         sheet_path = _sheet_path_for_name(archive, sheet_name)
@@ -505,10 +505,15 @@ def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row):
 
             for anchor in root.iter():
                 local = _xml_local_name(anchor.tag).lower()
-                if local not in {"onecellanchor", "twocellanchor"}:
+                if local not in {"onecellanchor", "twocellanchor", "absoluteanchor"}:
                     continue
 
-                row, col = _anchor_row_col_from_node(anchor, start_row=start_row)
+                if local in {"onecellanchor", "twocellanchor"}:
+                    row, col = _anchor_row_col_from_node(anchor, start_row=start_row)
+                else:
+                    y_emu = _position_y_emu_from_anchor(anchor)
+                    row = _row_from_y_emu(ws, y_emu)
+                    col = None
                 if row is None:
                     continue
 
@@ -616,6 +621,25 @@ def _row_from_y_emu(ws, y_emu):
         cumulative += row_height_emu
         if y_value < cumulative:
             return row_idx
+    return None
+
+
+def _position_y_emu_from_anchor(anchor):
+    pos_node = None
+    for child in anchor:
+        if _xml_local_name(getattr(child, "tag", "")).lower() == "pos":
+            pos_node = child
+            break
+    if pos_node is None:
+        return None
+
+    # xdr:pos usually has unqualified x/y attributes.
+    y_value = pos_node.attrib.get("y")
+    if y_value is not None:
+        return y_value
+    for attr_name, attr_value in pos_node.attrib.items():
+        if _xml_local_name(attr_name).lower() == "y":
+            return attr_value
     return None
 
 
@@ -1156,7 +1180,7 @@ def extract_images():
     openpyxl_images = list(getattr(ws, "_images", []) or [])
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
     drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name, ws=ws)
-    related_anchor_entries = _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row)
+    related_anchor_entries = _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row, ws=ws)
     dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
     cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
