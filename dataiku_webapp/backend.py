@@ -31,7 +31,7 @@ FIXED_VENDOR_COL = 4  # Column D
 FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
 EMU_PER_POINT = 12700
 DEFAULT_ROW_HEIGHT_POINTS = 15.0
-BUILD_TAG = "strict-v12"
+BUILD_TAG = "strict-v13"
 
 
 def _json_error(message, status_code=400):
@@ -1454,20 +1454,35 @@ def extract_images():
                 # pair vendor/material rows (top-to-bottom) with media images (natural order).
                 if media_images:
                     extraction_mode = "media_order_fallback"
-                    mapping_info["strategy"] = "order_media_to_rows"
-                    ordered_rows = [item["row"] for item in internal_match_rows]
-                    hint_rows = [item["row"] for item in internal_match_rows if item.get("has_image_hint")]
-                    if hint_rows and len(hint_rows) >= len(media_images):
-                        # When enough A-column hints exist, use them to avoid noisy vendor rows.
-                        ordered_rows = hint_rows
-                    pair_count = min(len(ordered_rows), len(media_images))
+                    mapping_info["strategy"] = "order_media_to_rows_full"
+                    hint_items = [item for item in internal_match_rows if item.get("has_image_hint")]
+                    if hint_items and len(hint_items) >= max(3, int(0.8 * len(internal_match_rows))):
+                        ordered_items = hint_items
+                    else:
+                        ordered_items = list(internal_match_rows)
+
                     skipped_reasons.append(
                         "Using media-order fallback on cleaned A+D rows. [build: {0}]".format(BUILD_TAG)
                     )
 
-                    for idx in range(pair_count):
-                        row_idx = ordered_rows[idx]
-                        media_item = media_images[idx]
+                    code_to_media_idx = {}
+                    reused_by_code_count = 0
+                    cycled_count = 0
+                    for idx, item in enumerate(ordered_items):
+                        row_idx = item["row"]
+                        code = item.get("code")
+                        if idx < len(media_images):
+                            media_idx = idx
+                        else:
+                            media_idx = code_to_media_idx.get(code)
+                            if media_idx is not None:
+                                reused_by_code_count += 1
+                            else:
+                                media_idx = idx % len(media_images)
+                                cycled_count += 1
+                        if code and code not in code_to_media_idx:
+                            code_to_media_idx[code] = media_idx
+                        media_item = media_images[media_idx]
                         _write_entry_for_row(
                             row_idx,
                             {
@@ -1475,28 +1490,40 @@ def extract_images():
                                 "col": image_col,
                                 "ext": media_item["ext"],
                                 "data": media_item["data"],
-                                "source": "media_order:{0}".format(idx + 1),
+                                "source": "media_order:{0}".format(media_idx + 1),
                             },
                         )
 
-                    mapping_info["exact_row_matches"] = pair_count
-                    mapping_info["strict_col_matches"] = pair_count
-                    missing_rows = ordered_rows[pair_count:]
+                    mapping_info["exact_row_matches"] = len(ordered_items)
+                    mapping_info["strict_col_matches"] = len(ordered_items)
+
+                    covered_rows = {item["row"] for item in ordered_items}
+                    missing_rows = sorted(set(target_rows) - covered_rows)
                     mapping_info["missing_rows"] = missing_rows
                     if missing_rows:
                         skipped_count += len(missing_rows)
                         preview = ",".join(str(r) for r in missing_rows[:20])
                         skipped_reasons.append(
-                            "Order fallback: not enough images for all vendor/material rows. "
-                            "Missing rows: {0}{1}.".format(
+                            "Clean-row filter skipped non-image/noise rows: {0}{1}.".format(
                                 preview,
                                 "..." if len(missing_rows) > 20 else "",
                             )
                         )
 
-                    extra_count = len(media_images) - pair_count
+                    if reused_by_code_count:
+                        skipped_reasons.append(
+                            "Order fallback reused image index by repeated vendor/material code on {0} rows.".format(
+                                reused_by_code_count
+                            )
+                        )
+                    if cycled_count:
+                        skipped_reasons.append(
+                            "Order fallback cycled media sequence for remaining {0} rows.".format(cycled_count)
+                        )
+
+                    extra_count = len(media_images) - len(ordered_items)
                     if extra_count > 0:
-                        for extra_idx in range(pair_count, len(media_images)):
+                        for extra_idx in range(len(ordered_items), len(media_images)):
                             media_item = media_images[extra_idx]
                             out_data, out_ext, did_upscale = _maybe_upscale_image(
                                 media_item["data"],
