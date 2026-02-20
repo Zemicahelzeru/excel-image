@@ -31,7 +31,7 @@ FIXED_VENDOR_COL = 4  # Column D
 FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
 EMU_PER_POINT = 12700
 DEFAULT_ROW_HEIGHT_POINTS = 15.0
-BUILD_TAG = "strict-v13"
+BUILD_TAG = "strict-v14"
 
 
 def _json_error(message, status_code=400):
@@ -1156,6 +1156,45 @@ def _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_co
     return rows
 
 
+def _build_one_by_one_rows(ws, internal_match_rows, image_col, dispimg_row_keys=None):
+    dispimg_rows = set((dispimg_row_keys or {}).keys())
+    result = []
+    default_height = (
+        getattr(getattr(ws, "sheet_format", None), "defaultRowHeight", None)
+        or DEFAULT_ROW_HEIGHT_POINTS
+    )
+    try:
+        default_height = float(default_height)
+    except Exception:
+        default_height = DEFAULT_ROW_HEIGHT_POINTS
+
+    for item in internal_match_rows:
+        row_idx = item["row"]
+        image_value = ws.cell(row_idx, image_col).value if image_col else None
+        image_text = _cell_text(image_value)
+        image_label = _normalize_label(image_text)
+
+        # Keep rows where column A looks like an image marker/formula,
+        # or where row height is significantly enlarged (common for image rows).
+        has_a_signal = False
+        if row_idx in dispimg_rows:
+            has_a_signal = True
+        elif image_text:
+            if image_label not in {"n/a", "na", "none", "null", "-", "--"}:
+                has_a_signal = True
+        else:
+            try:
+                if _row_height_points(ws, row_idx) >= (default_height * 1.8):
+                    has_a_signal = True
+            except Exception:
+                has_a_signal = False
+
+        if has_a_signal:
+            result.append(item)
+
+    return result
+
+
 def _collect_target_rows(ws, start_row, image_col, vendor_col, material_col):
     return [item["row"] for item in _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_col)]
 
@@ -1329,6 +1368,7 @@ def extract_images():
         # Mapping remains row-locked; this only broadens anchor discovery, not assignment logic.
         global_drawing_entries = _extract_global_drawing_anchor_images(file_bytes, ws=ws)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
+    one_by_one_rows = _build_one_by_one_rows(ws, internal_match_rows, image_col, dispimg_row_keys=dispimg_row_keys)
     media_images = _extract_media_images(file_bytes)
     unique_dispimg_keys = len(
         {
@@ -1453,36 +1493,29 @@ def extract_images():
                 # User-requested fallback for files with no recoverable row anchors:
                 # pair vendor/material rows (top-to-bottom) with media images (natural order).
                 if media_images:
-                    extraction_mode = "media_order_fallback"
-                    mapping_info["strategy"] = "order_media_to_rows_full"
-                    hint_items = [item for item in internal_match_rows if item.get("has_image_hint")]
-                    if hint_items and len(hint_items) >= max(3, int(0.8 * len(internal_match_rows))):
-                        ordered_items = hint_items
-                    else:
+                    extraction_mode = "media_one_by_one_fallback"
+                    mapping_info["strategy"] = "one_by_one_rows_to_media"
+                    ordered_items = list(one_by_one_rows) if one_by_one_rows else []
+                    selected_rows = {item["row"] for item in ordered_items}
+                    if len(ordered_items) < len(media_images):
+                        for item in internal_match_rows:
+                            if item["row"] in selected_rows:
+                                continue
+                            ordered_items.append(item)
+                            selected_rows.add(item["row"])
+                            if len(ordered_items) >= len(media_images):
+                                break
+                    if not ordered_items:
                         ordered_items = list(internal_match_rows)
 
                     skipped_reasons.append(
-                        "Using media-order fallback on cleaned A+D rows. [build: {0}]".format(BUILD_TAG)
+                        "Using one-by-one fallback (row-by-row) on cleaned A+D rows. [build: {0}]".format(BUILD_TAG)
                     )
 
-                    code_to_media_idx = {}
-                    reused_by_code_count = 0
-                    cycled_count = 0
-                    for idx, item in enumerate(ordered_items):
-                        row_idx = item["row"]
-                        code = item.get("code")
-                        if idx < len(media_images):
-                            media_idx = idx
-                        else:
-                            media_idx = code_to_media_idx.get(code)
-                            if media_idx is not None:
-                                reused_by_code_count += 1
-                            else:
-                                media_idx = idx % len(media_images)
-                                cycled_count += 1
-                        if code and code not in code_to_media_idx:
-                            code_to_media_idx[code] = media_idx
-                        media_item = media_images[media_idx]
+                    pair_count = min(len(ordered_items), len(media_images))
+                    for idx in range(pair_count):
+                        row_idx = ordered_items[idx]["row"]
+                        media_item = media_images[idx]
                         _write_entry_for_row(
                             row_idx,
                             {
@@ -1490,40 +1523,28 @@ def extract_images():
                                 "col": image_col,
                                 "ext": media_item["ext"],
                                 "data": media_item["data"],
-                                "source": "media_order:{0}".format(media_idx + 1),
+                                "source": "media_order:{0}".format(idx + 1),
                             },
                         )
 
-                    mapping_info["exact_row_matches"] = len(ordered_items)
-                    mapping_info["strict_col_matches"] = len(ordered_items)
-
-                    covered_rows = {item["row"] for item in ordered_items}
+                    mapping_info["exact_row_matches"] = pair_count
+                    mapping_info["strict_col_matches"] = pair_count
+                    covered_rows = {ordered_items[idx]["row"] for idx in range(pair_count)}
                     missing_rows = sorted(set(target_rows) - covered_rows)
                     mapping_info["missing_rows"] = missing_rows
                     if missing_rows:
                         skipped_count += len(missing_rows)
                         preview = ",".join(str(r) for r in missing_rows[:20])
                         skipped_reasons.append(
-                            "Clean-row filter skipped non-image/noise rows: {0}{1}.".format(
+                            "One-by-one fallback has no paired image for rows: {0}{1}.".format(
                                 preview,
                                 "..." if len(missing_rows) > 20 else "",
                             )
                         )
 
-                    if reused_by_code_count:
-                        skipped_reasons.append(
-                            "Order fallback reused image index by repeated vendor/material code on {0} rows.".format(
-                                reused_by_code_count
-                            )
-                        )
-                    if cycled_count:
-                        skipped_reasons.append(
-                            "Order fallback cycled media sequence for remaining {0} rows.".format(cycled_count)
-                        )
-
-                    extra_count = len(media_images) - len(ordered_items)
+                    extra_count = len(media_images) - pair_count
                     if extra_count > 0:
-                        for extra_idx in range(len(ordered_items), len(media_images)):
+                        for extra_idx in range(pair_count, len(media_images)):
                             media_item = media_images[extra_idx]
                             out_data, out_ext, did_upscale = _maybe_upscale_image(
                                 media_item["data"],
@@ -1532,7 +1553,7 @@ def extract_images():
                             )
                             if did_upscale:
                                 upscaled_count += 1
-                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - len(ordered_items) + 1)
+                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - pair_count + 1)
                             filename = _next_unique_filename(generic_name, out_ext, seen_filenames)
                             zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                             extracted_count += 1
@@ -1602,6 +1623,7 @@ def extract_images():
                 "Detected material column: {0}".format(material_col or "none"),
                 "Data start row: {0}".format(start_row),
                 "Internal A+D clean rows: {0}".format(len(internal_match_rows)),
+                "One-by-one candidate rows (A-signal + clean code): {0}".format(len(one_by_one_rows)),
                 "Internal rows with A-column hints: {0}".format(
                     len([item for item in internal_match_rows if item.get("has_image_hint")])
                 ),
@@ -1630,7 +1652,7 @@ def extract_images():
                 "- Matching rows are first cleaned internally from columns A + D (+F fallback) to remove headers/noise.",
                 "- Row mapping starts after detected header rows.",
                 "- No nearest-row guessing and no offset guessing in strict mode.",
-                "- If no row anchors are recoverable, fallback maps rows and media by order (top-to-bottom).",
+                "- If no row anchors are recoverable, fallback pairs rows/images one-by-one in order (top-to-bottom).",
                 "- Images anchored to non-target rows are never reassigned to a different row.",
                 "- Rows without anchored images are reported as missing.",
                 "- Preferred name is Vendor Material from detected vendor column.",
