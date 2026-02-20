@@ -619,7 +619,12 @@ def _extract_dispimg_key(formula):
     if not key_match:
         key_match = re.search(r"DISPIMG\(\s*'([^']+)'", formula, flags=re.IGNORECASE)
     if not key_match:
-        return None
+        # Some variants embed ID_* directly in longer formulas.
+        generic_match = re.search(r"(ID_[A-Za-z0-9_-]+)", formula, flags=re.IGNORECASE)
+        if not generic_match:
+            return None
+        key = (generic_match.group(1) or "").strip()
+        return key or None
     key = (key_match.group(1) or "").strip()
     return key or None
 
@@ -670,6 +675,40 @@ def _extract_dispimg_row_map(archive, sheet_path, image_col, start_row):
         key = _extract_dispimg_key(formula)
         if key:
             row_map[row_idx] = key
+    return row_map
+
+
+def _extract_dispimg_row_map_openpyxl(file_bytes, sheet_name, image_col, start_row):
+    row_map = {}
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(
+            io.BytesIO(file_bytes),
+            data_only=False,
+            keep_links=False,
+            read_only=True,
+        )
+        if sheet_name not in wb.sheetnames:
+            return row_map
+        ws = wb[sheet_name]
+        max_row = ws.max_row or 0
+        for row_idx in range(1, max_row + 1):
+            if start_row and row_idx < start_row:
+                continue
+            value = ws.cell(row_idx, image_col).value
+            if not isinstance(value, str):
+                continue
+            key = _extract_dispimg_key(value)
+            if key:
+                row_map[row_idx] = key
+    except Exception:
+        return row_map
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
     return row_map
 
 
@@ -901,11 +940,23 @@ def _extract_cellimages_anchor_entries(file_bytes, image_col, start_row):
 
 
 def _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row):
+    row_map = {}
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
         sheet_path = _sheet_path_for_name(archive, sheet_name)
-        if not sheet_path or sheet_path not in archive.namelist():
-            return {}
-        return _extract_dispimg_row_map(archive, sheet_path, image_col, start_row)
+        if sheet_path and sheet_path in archive.namelist():
+            row_map = _extract_dispimg_row_map(archive, sheet_path, image_col, start_row)
+
+    # Fallback parser for workbooks where XML shared-formula parsing misses DISPIMG rows.
+    openpyxl_row_map = _extract_dispimg_row_map_openpyxl(
+        file_bytes,
+        sheet_name,
+        image_col,
+        start_row,
+    )
+    if openpyxl_row_map:
+        for row_idx, key in openpyxl_row_map.items():
+            row_map.setdefault(row_idx, key)
+    return row_map
 
 
 def _build_dispimg_sequence_entries(row_key_map, image_col, media_images):
@@ -1231,7 +1282,7 @@ def extract_images():
                 skipped_count += len(target_rows)
                 skipped_reasons.append(
                     "No row-anchored images found for target rows. "
-                    "Strict mode forbids row-order or code-order guessing."
+                    "Strict mode forbids row-order or code-order guessing. [build: strict-v7]"
                 )
                 skipped_reasons.append(
                     "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
