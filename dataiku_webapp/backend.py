@@ -61,10 +61,30 @@ def _safe_name(value):
 
 def _anchor_row_col(img):
     anchor = getattr(img, "anchor", None)
-    if anchor:
-        from_cell = getattr(anchor, "_from", None)
-        if from_cell:
-            return from_cell.row + 1, from_cell.col + 1
+    if not anchor:
+        return None, None
+
+    # Some workbooks expose anchor as a plain cell reference string, e.g. "A36".
+    if isinstance(anchor, str):
+        return _cell_ref_to_row_col(anchor)
+
+    from_cell = getattr(anchor, "_from", None)
+    if from_cell is not None:
+        row = getattr(from_cell, "row", None)
+        col = getattr(from_cell, "col", None)
+        if isinstance(row, int) and isinstance(col, int):
+            return row + 1, col + 1
+
+    # Fallback for marker-like anchors that directly expose row/col.
+    row = getattr(anchor, "row", None)
+    col = getattr(anchor, "col", None)
+    if isinstance(row, int) and isinstance(col, int):
+        return row + 1, col + 1
+
+    # Final fallback: parse DrawingML-style <from><row>/<col> markers.
+    row, col = _anchor_row_col_from_node(anchor, start_row=None)
+    if row is not None:
+        return row, col
     return None, None
 
 
@@ -388,16 +408,7 @@ def _extract_drawing_images_for_sheet(file_bytes, sheet_name):
             for anchor in drawing_root.findall("xdr:twoCellAnchor", ns) + drawing_root.findall(
                 "xdr:oneCellAnchor", ns
             ):
-                from_node = anchor.find("xdr:from", ns)
-                row = None
-                col = None
-                if from_node is not None:
-                    row_text = from_node.findtext("xdr:row", default=None, namespaces=ns)
-                    col_text = from_node.findtext("xdr:col", default=None, namespaces=ns)
-                    if row_text is not None and row_text.isdigit():
-                        row = int(row_text) + 1
-                    if col_text is not None and col_text.isdigit():
-                        col = int(col_text) + 1
+                row, col = _anchor_row_col_from_node(anchor, start_row=None)
 
                 blip = anchor.find(".//a:blip", ns)
                 if blip is None:
@@ -480,22 +491,7 @@ def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row):
                 if local not in {"onecellanchor", "twocellanchor"}:
                     continue
 
-                row = None
-                col = None
-                from_node = None
-                for child in anchor.iter():
-                    if _xml_local_name(child.tag).lower() == "from":
-                        from_node = child
-                        break
-                if from_node is not None:
-                    for part in from_node:
-                        part_name = _xml_local_name(part.tag).lower()
-                        part_text = (part.text or "").strip()
-                        if part_name == "row" and part_text.isdigit():
-                            row = int(part_text) + 1
-                        elif part_name == "col" and part_text.isdigit():
-                            col = int(part_text) + 1
-
+                row, col = _anchor_row_col_from_node(anchor, start_row=start_row)
                 if row is None:
                     continue
 
@@ -564,6 +560,56 @@ def _cell_ref_to_row_col(cell_ref):
     for ch in col_letters:
         col_idx = col_idx * 26 + (ord(ch) - ord("A") + 1)
     return row_idx, col_idx
+
+
+def _anchor_row_col_from_node(anchor, start_row=None):
+    row = None
+    col = None
+
+    # Prefer direct child lookup; fallback to deep scan for non-standard XML wrappers.
+    from_node = None
+    try:
+        direct_children = list(anchor)
+    except Exception:
+        direct_children = []
+    for child in direct_children:
+        child_tag = getattr(child, "tag", None)
+        if child_tag is not None and _xml_local_name(child_tag).lower() == "from":
+            from_node = child
+            break
+    if from_node is None:
+        try:
+            iterator = anchor.iter()
+        except Exception:
+            iterator = []
+        for child in iterator:
+            child_tag = getattr(child, "tag", None)
+            if child_tag is not None and _xml_local_name(child_tag).lower() == "from":
+                from_node = child
+                break
+    if from_node is None:
+        return None, None
+
+    for part in from_node:
+        tag = getattr(part, "tag", None)
+        if tag is None:
+            continue
+        tag_name = _xml_local_name(tag).lower()
+        text_value = (part.text or "").strip()
+        if tag_name == "row":
+            try:
+                row = int(text_value) + 1
+            except Exception:
+                row = None
+        elif tag_name == "col":
+            try:
+                col = int(text_value) + 1
+            except Exception:
+                col = None
+
+    if row is not None and (start_row is None or row >= start_row):
+        return row, col
+    return None, None
 
 
 def _extract_dispimg_key(formula):
@@ -816,22 +862,7 @@ def _extract_cellimages_anchor_entries(file_bytes, image_col, start_row):
                 if anchor_local not in {"onecellanchor", "twocellanchor"}:
                     continue
 
-                row = None
-                col = None
-                from_node = None
-                for child in anchor.iter():
-                    if _xml_local_name(child.tag).lower() == "from":
-                        from_node = child
-                        break
-                if from_node is not None:
-                    for part in from_node:
-                        part_name = _xml_local_name(part.tag).lower()
-                        part_text = (part.text or "").strip()
-                        if part_name == "row" and part_text.isdigit():
-                            row = int(part_text) + 1
-                        elif part_name == "col" and part_text.isdigit():
-                            col = int(part_text) + 1
-
+                row, col = _anchor_row_col_from_node(anchor, start_row=start_row)
                 if row is None:
                     continue
 
