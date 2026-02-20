@@ -908,6 +908,48 @@ def _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row):
         return _extract_dispimg_row_map(archive, sheet_path, image_col, start_row)
 
 
+def _build_dispimg_sequence_entries(row_key_map, image_col, media_images):
+    if not row_key_map or not media_images:
+        return []
+
+    ordered_rows = sorted(row_key_map.keys())
+    ordered_keys = []
+    seen_keys = set()
+    for row_idx in ordered_rows:
+        norm_key = _normalize_mapping_key(row_key_map.get(row_idx))
+        if not norm_key or norm_key in seen_keys:
+            continue
+        seen_keys.add(norm_key)
+        ordered_keys.append(norm_key)
+
+    # Safety gate: only use sequence mapping if unique DISPIMG keys and media count
+    # match exactly. This avoids offset drift.
+    if not ordered_keys or len(ordered_keys) != len(media_images):
+        return []
+
+    key_to_media = {
+        key: media_images[idx]
+        for idx, key in enumerate(ordered_keys)
+    }
+
+    entries = []
+    for row_idx in ordered_rows:
+        norm_key = _normalize_mapping_key(row_key_map.get(row_idx))
+        media = key_to_media.get(norm_key)
+        if not media:
+            continue
+        entries.append(
+            {
+                "row": row_idx,
+                "col": image_col,
+                "ext": media["ext"],
+                "data": media["data"],
+                "source": "dispimg_seq:{0}".format(norm_key or row_idx),
+            }
+        )
+    return entries
+
+
 def _collect_target_rows(ws, start_row, vendor_col, material_col):
     rows = []
     max_row = ws.max_row or start_row
@@ -1068,6 +1110,13 @@ def extract_images():
     cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
     media_images = _extract_media_images(file_bytes)
+    dispimg_sequence_entries = []
+    if not dispimg_entries and dispimg_row_keys and media_images:
+        dispimg_sequence_entries = _build_dispimg_sequence_entries(
+            dispimg_row_keys,
+            image_col,
+            media_images,
+        )
 
     extracted_count = 0
     skipped_count = 0
@@ -1100,6 +1149,9 @@ def extract_images():
             if dispimg_entries:
                 source_entries = dispimg_entries
                 extraction_mode = "dispimg_cellimages"
+            elif dispimg_sequence_entries:
+                source_entries = dispimg_sequence_entries
+                extraction_mode = "dispimg_key_sequence_media"
             elif related_anchor_entries:
                 source_entries = related_anchor_entries
                 extraction_mode = "sheet_related_anchor"
@@ -1206,6 +1258,7 @@ def extract_images():
                 "Data start row: {0}".format(start_row),
                 "Vendor/material target rows: {0}".format(len(target_rows)),
                 "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
+                "DISPIMG key-sequence entries: {0}".format(len(dispimg_sequence_entries)),
                 "Sheet-related row-anchored entries: {0}".format(len(related_anchor_entries)),
                 "Cellimages row-anchored entries: {0}".format(len(cellimages_anchor_entries)),
                 "DISPIMG formula rows in image column: {0}".format(len(dispimg_row_keys)),
@@ -1225,6 +1278,7 @@ def extract_images():
                 "- Row mapping starts after detected header rows.",
                 "- No nearest-row guessing and no offset guessing.",
                 "- No row-order fallback and no code-group fallback are allowed.",
+                "- If DISPIMG keys exist and unique-key count matches media count, mapping may use DISPIMG key sequence.",
                 "- Rows without anchored images are reported as missing.",
                 "- Preferred name is Vendor Material from detected vendor column.",
                 "- If Vendor is empty and Original Material exists, file uses MAT_<material>.",
