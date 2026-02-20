@@ -1532,7 +1532,7 @@ def extract_images():
                             )
                             if did_upscale:
                                 upscaled_count += 1
-                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - pair_count + 1)
+                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - len(ordered_items) + 1)
                             filename = _next_unique_filename(generic_name, out_ext, seen_filenames)
                             zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                             extracted_count += 1
