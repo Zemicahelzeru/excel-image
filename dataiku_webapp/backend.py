@@ -1056,6 +1056,11 @@ def health():
     return jsonify(status="ok")
 
 
+@app.route("/backend/health")
+def health_backend_alias():
+    return jsonify(status="ok")
+
+
 @app.route("/get_sheets", methods=["POST"])
 def get_sheets():
     file_bytes, _filename, error = _get_uploaded_file()
