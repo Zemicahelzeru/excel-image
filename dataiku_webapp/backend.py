@@ -1398,29 +1398,87 @@ def extract_images():
                     skipped_count += len(missing_rows)
 
             elif target_rows:
-                extraction_mode = "strict_row_locked_no_row_anchors"
-                mapping_info["strategy"] = "strict_only_no_source_entries"
-                mapping_info["exact_row_matches"] = 0
-                mapping_info["strict_col_matches"] = 0
-                mapping_info["missing_rows"] = sorted(target_rows)
-                skipped_count += len(target_rows)
-                skipped_reasons.append(
-                    "No row-anchored images found for target rows. "
-                    "Strict mode forbids row-order or code-order guessing. [build: strict-v10]"
-                )
-                skipped_reasons.append(
-                    "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
-                    "media images={2}, sheet-related anchors={3}, drawing anchors={4}, "
-                    "global drawing anchors={5}, openpyxl anchors={6}.".format(
-                        len(dispimg_row_keys),
-                        unique_dispimg_keys,
-                        len(media_images),
-                        len(related_anchor_entries),
-                        len(drawing_entries),
-                        len(global_drawing_entries),
-                        len(openpyxl_entries),
+                # User-requested fallback for files with no recoverable row anchors:
+                # pair vendor/material rows (top-to-bottom) with media images (natural order).
+                if media_images:
+                    extraction_mode = "media_order_fallback"
+                    mapping_info["strategy"] = "order_media_to_rows"
+                    ordered_rows = sorted(target_rows)
+                    pair_count = min(len(ordered_rows), len(media_images))
+
+                    for idx in range(pair_count):
+                        row_idx = ordered_rows[idx]
+                        media_item = media_images[idx]
+                        _write_entry_for_row(
+                            row_idx,
+                            {
+                                "row": row_idx,
+                                "col": image_col,
+                                "ext": media_item["ext"],
+                                "data": media_item["data"],
+                                "source": "media_order:{0}".format(idx + 1),
+                            },
+                        )
+
+                    mapping_info["exact_row_matches"] = pair_count
+                    mapping_info["strict_col_matches"] = pair_count
+                    missing_rows = ordered_rows[pair_count:]
+                    mapping_info["missing_rows"] = missing_rows
+                    if missing_rows:
+                        skipped_count += len(missing_rows)
+                        preview = ",".join(str(r) for r in missing_rows[:20])
+                        skipped_reasons.append(
+                            "Order fallback: not enough images for all vendor/material rows. "
+                            "Missing rows: {0}{1}.".format(
+                                preview,
+                                "..." if len(missing_rows) > 20 else "",
+                            )
+                        )
+
+                    extra_count = len(media_images) - pair_count
+                    if extra_count > 0:
+                        for extra_idx in range(pair_count, len(media_images)):
+                            media_item = media_images[extra_idx]
+                            out_data, out_ext, did_upscale = _maybe_upscale_image(
+                                media_item["data"],
+                                media_item["ext"],
+                                scale_factor=3,
+                            )
+                            if did_upscale:
+                                upscaled_count += 1
+                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - pair_count + 1)
+                            filename = _next_unique_filename(generic_name, out_ext, seen_filenames)
+                            zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                            extracted_count += 1
+                        skipped_reasons.append(
+                            "Order fallback: exported {0} extra images with UNMAPPED_IMAGE_* names.".format(
+                                extra_count
+                            )
+                        )
+                else:
+                    extraction_mode = "strict_row_locked_no_row_anchors"
+                    mapping_info["strategy"] = "strict_only_no_source_entries"
+                    mapping_info["exact_row_matches"] = 0
+                    mapping_info["strict_col_matches"] = 0
+                    mapping_info["missing_rows"] = sorted(target_rows)
+                    skipped_count += len(target_rows)
+                    skipped_reasons.append(
+                        "No row-anchored images found for target rows and no media images were available. "
+                        "Strict mode cannot assign names. [build: strict-v11]"
                     )
-                )
+                    skipped_reasons.append(
+                        "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
+                        "media images={2}, sheet-related anchors={3}, drawing anchors={4}, "
+                        "global drawing anchors={5}, openpyxl anchors={6}.".format(
+                            len(dispimg_row_keys),
+                            unique_dispimg_keys,
+                            len(media_images),
+                            len(related_anchor_entries),
+                            len(drawing_entries),
+                            len(global_drawing_entries),
+                            len(openpyxl_entries),
+                        )
+                    )
 
             # If no vendor/material rows were found, still export discovered images.
             elif source_entries:
@@ -1477,10 +1535,10 @@ def extract_images():
                 "Skipped images: {0}".format(skipped_count),
                 "",
                 "Rules:",
-                "- Strict same-row mapping: vendor/material row N uses image row N.",
+                "- Primary mode is strict same-row mapping: vendor/material row N uses image row N.",
                 "- Row mapping starts after detected header rows.",
-                "- No nearest-row guessing and no offset guessing.",
-                "- No row-order fallback and no code-group fallback are allowed.",
+                "- No nearest-row guessing and no offset guessing in strict mode.",
+                "- If no row anchors are recoverable, fallback maps rows and media by order (top-to-bottom).",
                 "- Images anchored to non-target rows are never reassigned to a different row.",
                 "- Rows without anchored images are reported as missing.",
                 "- Preferred name is Vendor Material from detected vendor column.",
