@@ -456,6 +456,76 @@ def _extract_drawing_images_for_sheet(file_bytes, sheet_name, ws=None):
     return entries
 
 
+def _extract_global_drawing_anchor_images(file_bytes, ws=None):
+    entries = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
+        drawing_paths = [
+            name
+            for name in archive.namelist()
+            if name.lower().startswith("xl/drawings/") and name.lower().endswith(".xml")
+        ]
+        drawing_paths.sort(key=_natural_sort_key)
+        idx = 0
+        for drawing_path in drawing_paths:
+            try:
+                drawing_root = ET.fromstring(archive.read(drawing_path))
+            except Exception:
+                continue
+
+            drawing_rels_path = "{0}/_rels/{1}.rels".format(
+                posixpath.dirname(drawing_path),
+                posixpath.basename(drawing_path),
+            )
+            drawing_rels = _read_relationships(archive, drawing_rels_path)
+            if not drawing_rels:
+                continue
+
+            for anchor in drawing_root.iter():
+                local_name = _xml_local_name(getattr(anchor, "tag", "")).lower()
+                if local_name not in {"onecellanchor", "twocellanchor", "absoluteanchor"}:
+                    continue
+
+                if local_name in {"onecellanchor", "twocellanchor"}:
+                    row, col = _anchor_row_col_from_node(anchor, start_row=None)
+                else:
+                    y_emu = _position_y_emu_from_anchor(anchor)
+                    row = _row_from_y_emu(ws, y_emu)
+                    col = None
+                if row is None:
+                    continue
+
+                embed_rel = None
+                for child in anchor.iter():
+                    for attr_name, attr_value in child.attrib.items():
+                        if _xml_local_name(attr_name).lower() == "embed" and attr_value:
+                            embed_rel = attr_value
+                            break
+                    if embed_rel:
+                        break
+                if not embed_rel:
+                    continue
+
+                target = drawing_rels.get(embed_rel)
+                media_path = _resolve_zip_path(drawing_path, target)
+                if not media_path or media_path not in archive.namelist():
+                    continue
+                data = archive.read(media_path)
+                if not data:
+                    continue
+                idx += 1
+                entries.append(
+                    {
+                        "row": row,
+                        "col": col,
+                        "ext": _normalize_ext(Path(media_path).suffix, data),
+                        "data": data,
+                        "source": "global_drawing:{0}".format(idx),
+                    }
+                )
+    entries.sort(key=lambda item: (item.get("row") or 10**9, item.get("col") or 10**9, item["source"]))
+    return entries
+
+
 def _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row, ws=None):
     entries = []
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
@@ -1045,13 +1115,24 @@ def _assign_entries_to_rows(target_rows, entries, image_col):
         "exact_row_matches": 0,
         "strict_col_matches": 0,
         "missing_rows": [],
+        "ignored_non_image_col_entries": 0,
     }
     if not target_rows or not entries:
         diagnostics["missing_rows"] = sorted(target_rows or [])
         return [], diagnostics
 
     # Strict coordinate mapping: row-id -> image entry.
-    strict_map = {entry["row"]: entry for entry in entries if entry.get("row") is not None}
+    strict_map = {}
+    for entry in entries:
+        row_idx = entry.get("row")
+        if row_idx is None:
+            continue
+        col_idx = entry.get("col")
+        if col_idx not in (None, image_col):
+            diagnostics["ignored_non_image_col_entries"] += 1
+            continue
+        # Keep first entry per row for deterministic mapping.
+        strict_map.setdefault(row_idx, entry)
 
     mapped = []
     missing_rows = []
@@ -1183,6 +1264,18 @@ def extract_images():
     related_anchor_entries = _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row, ws=ws)
     dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
     cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
+    global_drawing_entries = []
+    if (
+        not dispimg_entries
+        and not related_anchor_entries
+        and not cellimages_anchor_entries
+        and not drawing_entries
+        and not openpyxl_entries
+        and len(wb.sheetnames) == 1
+    ):
+        # Aggressive strict fallback: if the workbook has only one sheet, scan all drawing parts.
+        # Mapping remains row-locked; this only broadens anchor discovery, not assignment logic.
+        global_drawing_entries = _extract_global_drawing_anchor_images(file_bytes, ws=ws)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
     media_images = _extract_media_images(file_bytes)
     unique_dispimg_keys = len(
@@ -1204,6 +1297,7 @@ def extract_images():
         "exact_row_matches": 0,
         "strict_col_matches": 0,
         "missing_rows": [],
+        "ignored_non_image_col_entries": 0,
     }
 
     excel_name_no_ext = Path(original_filename).stem if original_filename else "Excel_Images"
@@ -1233,6 +1327,9 @@ def extract_images():
             elif drawing_entries:
                 source_entries = drawing_entries
                 extraction_mode = "drawing_anchor"
+            elif global_drawing_entries:
+                source_entries = global_drawing_entries
+                extraction_mode = "global_drawing_anchor_single_sheet"
             elif openpyxl_entries:
                 source_entries = openpyxl_entries
                 extraction_mode = "openpyxl_anchor"
@@ -1309,16 +1406,18 @@ def extract_images():
                 skipped_count += len(target_rows)
                 skipped_reasons.append(
                     "No row-anchored images found for target rows. "
-                    "Strict mode forbids row-order or code-order guessing. [build: strict-v9]"
+                    "Strict mode forbids row-order or code-order guessing. [build: strict-v10]"
                 )
                 skipped_reasons.append(
                     "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
-                    "media images={2}, sheet-related anchors={3}, drawing anchors={4}, openpyxl anchors={5}.".format(
+                    "media images={2}, sheet-related anchors={3}, drawing anchors={4}, "
+                    "global drawing anchors={5}, openpyxl anchors={6}.".format(
                         len(dispimg_row_keys),
                         unique_dispimg_keys,
                         len(media_images),
                         len(related_anchor_entries),
                         len(drawing_entries),
+                        len(global_drawing_entries),
                         len(openpyxl_entries),
                     )
                 )
@@ -1364,11 +1463,15 @@ def extract_images():
                 "DISPIMG formula rows in image column: {0}".format(len(dispimg_row_keys)),
                 "Openpyxl anchored images: {0}".format(len(openpyxl_entries)),
                 "Drawing anchored images: {0}".format(len(drawing_entries)),
+                "Global drawing anchored images (single-sheet fallback): {0}".format(len(global_drawing_entries)),
                 "XLSX media items: {0}".format(len(media_images)),
                 "Upscaled images (3x): {0}".format(upscaled_count),
                 "Mapping strategy: {0}".format(mapping_info.get("strategy")),
                 "Mapping exact row matches: {0}".format(mapping_info.get("exact_row_matches")),
                 "Mapping strict image-column matches: {0}".format(mapping_info.get("strict_col_matches")),
+                "Mapping ignored non-image-column anchors: {0}".format(
+                    mapping_info.get("ignored_non_image_col_entries")
+                ),
                 "Mapping missing rows: {0}".format(len(mapping_info.get("missing_rows") or [])),
                 "Extracted images: {0}".format(extracted_count),
                 "Skipped images: {0}".format(skipped_count),
