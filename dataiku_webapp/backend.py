@@ -241,8 +241,13 @@ def _detect_layout(ws):
         if material_header_row is None and _is_material_header_label(material_label):
             material_header_row = row_idx
 
-    header_rows = [r for r in (image_header_row, vendor_header_row, material_header_row) if r is not None]
-    start_row = max(header_rows) + 1 if header_rows else 2
+    # Do not use max(header_rows): image cells can contain "Picture" text lower in the sheet
+    # and would incorrectly shift every target row downward.
+    if vendor_header_row is not None:
+        start_row = vendor_header_row + 1
+    else:
+        header_rows = [r for r in (image_header_row, material_header_row) if r is not None]
+        start_row = (min(header_rows) + 1) if header_rows else 2
 
     material_col = FIXED_MATERIAL_COL if (ws.max_column or 0) >= FIXED_MATERIAL_COL else None
     return {
@@ -836,44 +841,39 @@ def _collect_target_rows(ws, start_row, vendor_col, material_col):
 
 def _assign_entries_to_rows(target_rows, entries, image_col):
     diagnostics = {
-        "strategy": "strict_same_row",
+        "strategy": "strict_only",
         "exact_row_matches": 0,
         "strict_col_matches": 0,
         "missing_rows": [],
     }
-
     if not target_rows or not entries:
         diagnostics["missing_rows"] = sorted(target_rows or [])
         return [], diagnostics
 
-    row_entries = [entry for entry in entries if entry.get("row") is not None]
-    if not row_entries:
-        diagnostics["strategy"] = "no_row_entries"
-        diagnostics["missing_rows"] = sorted(target_rows)
-        return [], diagnostics
-
-    strict_row_map = {}
-    for entry in row_entries:
+    strict_map = {}
+    for entry in entries:
         row = entry.get("row")
         col = entry.get("col")
         if row is None:
             continue
-        if (col == image_col or image_col is None) and row not in strict_row_map:
-            strict_row_map[row] = entry
+        # Accept exact image column or unknown anchor column, but never a different row.
+        if col not in (None, image_col):
+            continue
+        if row not in strict_map:
+            strict_map[row] = entry
 
     mapped = []
+    missing_rows = []
     for row_idx in sorted(target_rows):
-        entry = strict_row_map.get(row_idx)
-        if entry is not None:
+        entry = strict_map.get(row_idx)
+        if entry is None:
+            missing_rows.append(row_idx)
+        else:
             mapped.append((row_idx, entry))
-            diagnostics["exact_row_matches"] += 1
-            diagnostics["strict_col_matches"] += 1
-            continue
 
-        diagnostics["missing_rows"].append(row_idx)
-
-    if diagnostics["missing_rows"]:
-        diagnostics["strategy"] = "strict_same_row_partial"
+    diagnostics["exact_row_matches"] = len(mapped)
+    diagnostics["strict_col_matches"] = len(mapped)
+    diagnostics["missing_rows"] = missing_rows
     return mapped, diagnostics
 
 
@@ -1060,25 +1060,7 @@ def extract_images():
                 zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                 extracted_count += 1
 
-            def _write_media_for_row(row_idx, media):
-                nonlocal extracted_count, upscaled_count
-                safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                if not safe_code:
-                    safe_code = "Row_{0}".format(row_idx)
-                if code_source == "material":
-                    skipped_reasons.append(
-                        "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
-                    )
-                out_data, out_ext, did_upscale = _maybe_upscale_image(
-                    media["data"], media["ext"], scale_factor=3
-                )
-                if did_upscale:
-                    upscaled_count += 1
-                filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
-                zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
-                extracted_count += 1
-
-            # Strict behavior requested: same row only (vendor row Dn -> image row An).
+            # Strict behavior: same row only (vendor/material row N -> image row N).
             if source_entries and target_rows:
                 mapped_rows, mapping_info = _assign_entries_to_rows(target_rows, source_entries, image_col)
                 for row_idx, entry in mapped_rows:
@@ -1089,166 +1071,25 @@ def extract_images():
                     extraction_mode = "strict_row_locked_missing_rows"
                     preview = ",".join(str(r) for r in missing_rows[:20])
                     skipped_reasons.append(
-                        "Strict row-locked mapping missing image rows: {0}{1}. "
-                        "No cross-row fallback is allowed.".format(
+                        "Strict row-only mapping missing image rows: {0}{1}. "
+                        "No order-based fallback is allowed.".format(
                             preview,
                             "..." if len(missing_rows) > 20 else "",
                         )
                     )
-                    unresolved_rows = []
-                    if media_images and dispimg_row_keys:
-                        extraction_mode = "strict_plus_dispimg_key_order_fallback"
-                        mapping_info["strategy"] = "strict_plus_dispimg_key_order_fallback"
-                        ordered_keys = []
-                        seen_keys = set()
-                        for row_idx in sorted(target_rows):
-                            norm_key = _normalize_mapping_key(dispimg_row_keys.get(row_idx))
-                            if norm_key and norm_key not in seen_keys:
-                                seen_keys.add(norm_key)
-                                ordered_keys.append(norm_key)
-                        key_to_media = {}
-                        for idx, key in enumerate(ordered_keys):
-                            if idx < len(media_images):
-                                key_to_media[key] = media_images[idx]
-                        for row_idx in missing_rows:
-                            norm_key = _normalize_mapping_key(dispimg_row_keys.get(row_idx))
-                            media = key_to_media.get(norm_key)
-                            if not media:
-                                unresolved_rows.append(row_idx)
-                                continue
-                            _write_media_for_row(row_idx, media)
-                    elif media_images and len(media_images) == len(target_rows):
-                        extraction_mode = "strict_plus_row_order_fallback"
-                        mapping_info["strategy"] = "strict_plus_row_order_fallback"
-                        row_to_media = {
-                            row_idx: media_images[idx]
-                            for idx, row_idx in enumerate(sorted(target_rows))
-                            if idx < len(media_images)
-                        }
-                        for row_idx in missing_rows:
-                            media = row_to_media.get(row_idx)
-                            if not media:
-                                unresolved_rows.append(row_idx)
-                                continue
-                            _write_media_for_row(row_idx, media)
-                    elif media_images:
-                        extraction_mode = "strict_plus_code_group_fallback"
-                        mapping_info["strategy"] = "strict_plus_code_group_fallback"
-                        code_to_media = {}
-                        media_ptr = 0
-                        for row_idx in missing_rows:
-                            safe_code, _code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                            code_key = (safe_code or "Row_{0}".format(row_idx)).upper()
-                            media = code_to_media.get(code_key)
-                            if media is None:
-                                if media_ptr < len(media_images):
-                                    media = media_images[media_ptr]
-                                    code_to_media[code_key] = media
-                                    media_ptr += 1
-                                else:
-                                    unresolved_rows.append(row_idx)
-                                    continue
-                            _write_media_for_row(row_idx, media)
-                    else:
-                        unresolved_rows = list(missing_rows)
-
-                    mapping_info["missing_rows"] = unresolved_rows
-                    if unresolved_rows:
-                        skipped_count += len(unresolved_rows)
-                        preview_unresolved = ",".join(str(r) for r in unresolved_rows[:20])
-                        skipped_reasons.append(
-                            "Unresolved rows after fallback attempts: {0}{1}".format(
-                                preview_unresolved,
-                                "..." if len(unresolved_rows) > 20 else "",
-                            )
-                        )
-                    else:
-                        skipped_reasons.append(
-                            "Missing anchored rows were filled using fallback mapping."
-                        )
+                    skipped_count += len(missing_rows)
 
             elif target_rows:
-                if dispimg_row_keys and media_images:
-                    extraction_mode = "dispimg_key_order_fallback"
-                    mapping_info["strategy"] = "dispimg_key_order_fallback"
-                    ordered_keys = []
-                    seen_keys = set()
-                    for row_idx in sorted(target_rows):
-                        norm_key = _normalize_mapping_key(dispimg_row_keys.get(row_idx))
-                        if norm_key and norm_key not in seen_keys:
-                            seen_keys.add(norm_key)
-                            ordered_keys.append(norm_key)
-                    key_to_media = {}
-                    for idx, key in enumerate(ordered_keys):
-                        if idx < len(media_images):
-                            key_to_media[key] = media_images[idx]
-                    unresolved_rows = []
-                    for row_idx in sorted(target_rows):
-                        norm_key = _normalize_mapping_key(dispimg_row_keys.get(row_idx))
-                        media = key_to_media.get(norm_key)
-                        if not media:
-                            unresolved_rows.append(row_idx)
-                            continue
-                        _write_media_for_row(row_idx, media)
-                    mapping_info["exact_row_matches"] = extracted_count
-                    mapping_info["strict_col_matches"] = 0
-                    mapping_info["missing_rows"] = unresolved_rows
-                    if unresolved_rows:
-                        skipped_count += len(unresolved_rows)
-                        preview = ",".join(str(r) for r in unresolved_rows[:20])
-                        skipped_reasons.append(
-                            "DISPIMG key-order fallback unresolved rows: {0}{1}".format(
-                                preview,
-                                "..." if len(unresolved_rows) > 20 else "",
-                            )
-                        )
-                elif media_images and len(media_images) == len(target_rows):
-                    extraction_mode = "row_order_media_fallback"
-                    mapping_info["strategy"] = "row_order_media_fallback_equal_count"
-                    for idx, row_idx in enumerate(sorted(target_rows)):
-                        _write_media_for_row(row_idx, media_images[idx])
-                    mapping_info["exact_row_matches"] = len(target_rows)
-                    mapping_info["strict_col_matches"] = 0
-                    mapping_info["missing_rows"] = []
-                elif media_images:
-                    extraction_mode = "code_grouped_media_fallback"
-                    mapping_info["strategy"] = "code_grouped_media_fallback"
-                    code_to_media = {}
-                    media_ptr = 0
-                    unresolved_rows = []
-                    for row_idx in sorted(target_rows):
-                        safe_code, _code_source = _row_code(ws, row_idx, vendor_col, material_col)
-                        code_key = (safe_code or "Row_{0}".format(row_idx)).upper()
-                        media = code_to_media.get(code_key)
-                        if media is None:
-                            if media_ptr < len(media_images):
-                                media = media_images[media_ptr]
-                                code_to_media[code_key] = media
-                                media_ptr += 1
-                            else:
-                                unresolved_rows.append(row_idx)
-                                continue
-                        _write_media_for_row(row_idx, media)
-                    mapping_info["exact_row_matches"] = extracted_count
-                    mapping_info["strict_col_matches"] = 0
-                    mapping_info["missing_rows"] = unresolved_rows
-                    if unresolved_rows:
-                        skipped_count += len(unresolved_rows)
-                        preview = ",".join(str(r) for r in unresolved_rows[:20])
-                        skipped_reasons.append(
-                            "Code-group fallback unresolved rows: {0}{1}".format(
-                                preview,
-                                "..." if len(unresolved_rows) > 20 else "",
-                            )
-                        )
-                else:
-                    extraction_mode = "strict_row_locked_no_row_anchors"
-                    mapping_info["strategy"] = "strict_row_locked_no_row_anchors"
-                    mapping_info["missing_rows"] = sorted(target_rows)
-                    skipped_count += len(target_rows)
-                    skipped_reasons.append(
-                        "No row-anchored images and no media fallback could be applied."
-                    )
+                extraction_mode = "strict_row_locked_no_row_anchors"
+                mapping_info["strategy"] = "strict_only_no_source_entries"
+                mapping_info["exact_row_matches"] = 0
+                mapping_info["strict_col_matches"] = 0
+                mapping_info["missing_rows"] = sorted(target_rows)
+                skipped_count += len(target_rows)
+                skipped_reasons.append(
+                    "No row-anchored images found for target rows. "
+                    "Strict mode forbids row-order or code-order guessing."
+                )
 
             # If no vendor/material rows were found, still export discovered images.
             elif source_entries:
@@ -1271,14 +1112,6 @@ def extract_images():
                     filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
                     zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                     extracted_count += 1
-
-            if target_rows and extracted_count and extracted_count != len(target_rows):
-                skipped_count += abs(len(target_rows) - extracted_count)
-                skipped_reasons.append(
-                    "Final count check failed: extracted {0}, vendor/material rows {1}.".format(
-                        extracted_count, len(target_rows)
-                    )
-                )
 
             summary_lines = [
                 "Excel Image Extraction Summary",
@@ -1312,8 +1145,8 @@ def extract_images():
                 "- Strict same-row mapping: vendor/material row N uses image row N.",
                 "- Row mapping starts after detected header rows.",
                 "- No nearest-row guessing and no offset guessing.",
-                "- When row anchors are incomplete, fallback may use DISPIMG key order, row order, or code groups.",
-                "- Summary always reports fallback usage and unresolved rows.",
+                "- No row-order fallback and no code-group fallback are allowed.",
+                "- Rows without anchored images are reported as missing.",
                 "- Preferred name is Vendor Material from detected vendor column.",
                 "- If Vendor is empty and Original Material exists, file uses MAT_<material>.",
                 "",
