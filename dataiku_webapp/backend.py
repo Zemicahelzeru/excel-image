@@ -1110,6 +1110,13 @@ def extract_images():
     cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
     dispimg_row_keys = _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row)
     media_images = _extract_media_images(file_bytes)
+    unique_dispimg_keys = len(
+        {
+            _normalize_mapping_key(value)
+            for value in dispimg_row_keys.values()
+            if _normalize_mapping_key(value)
+        }
+    )
     dispimg_sequence_entries = []
     if not dispimg_entries and dispimg_row_keys and media_images:
         dispimg_sequence_entries = _build_dispimg_sequence_entries(
@@ -1220,6 +1227,15 @@ def extract_images():
                 skipped_reasons.append(
                     "No row-anchored images found for target rows. "
                     "Strict mode forbids row-order or code-order guessing."
+                )
+                skipped_reasons.append(
+                    "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
+                    "media images={2}, DISPIMG key-sequence entries={3}.".format(
+                        len(dispimg_row_keys),
+                        unique_dispimg_keys,
+                        len(media_images),
+                        len(dispimg_sequence_entries),
+                    )
                 )
 
             # If no vendor/material rows were found, still export discovered images.
