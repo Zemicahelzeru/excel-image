@@ -1376,11 +1376,10 @@ def extract_images():
             os.remove(zip_path)
         except OSError:
             pass
-        error_message = (
-            skipped_reasons[0]
-            if skipped_reasons
-            else "No images were extracted. Ensure images are in Column A and not empty."
-        )
+        if skipped_reasons:
+            error_message = " | ".join(skipped_reasons[:3])
+        else:
+            error_message = "No images were extracted. Ensure images are in Column A and not empty."
         return _json_error(
             error_message,
             400,
