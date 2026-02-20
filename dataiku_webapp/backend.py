@@ -31,6 +31,7 @@ FIXED_VENDOR_COL = 4  # Column D
 FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
 EMU_PER_POINT = 12700
 DEFAULT_ROW_HEIGHT_POINTS = 15.0
+BUILD_TAG = "strict-v12"
 
 
 def _json_error(message, status_code=400):
@@ -170,7 +171,7 @@ def _is_image_header_label(label):
 
 
 def _is_vendor_header_label(label):
-    return bool(label and ("vendor" in label and "material" in label))
+    return bool(label and ("vendor" in label and ("material" in label or "mat" in label)))
 
 
 def _is_material_header_label(label):
@@ -183,6 +184,37 @@ def _is_material_header_label(label):
         or label.startswith("material")
         or "material #" in label
     )
+
+
+def _cell_text(value):
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def _is_unwanted_code_value(text, label):
+    if not text:
+        return True
+    if not re.search(r"[A-Za-z0-9]", text):
+        return True
+    if label in {"n/a", "na", "none", "null", "-", "--"}:
+        return True
+    if _is_vendor_header_label(label) or _is_material_header_label(label) or _is_image_header_label(label):
+        return True
+
+    noisy_tokens = (
+        "description",
+        "remark",
+        "comment",
+        "total",
+        "subtotal",
+        "grand total",
+        "header",
+        "title",
+        "example",
+        "sample",
+    )
+    if any(token in label for token in noisy_tokens) and not re.search(r"\d", text):
+        return True
+    return False
 
 
 def _safe_folder_name(filename):
@@ -285,15 +317,15 @@ def _detect_layout(ws):
 
 def _row_code(ws, row_idx, vendor_col, material_col):
     vendor_value = ws.cell(row_idx, vendor_col).value if vendor_col else None
-    vendor_text = str(vendor_value).strip() if vendor_value not in (None, "") else ""
+    vendor_text = _cell_text(vendor_value)
     vendor_label = _normalize_label(vendor_text)
-    if vendor_text and not _is_vendor_header_label(vendor_label):
+    if vendor_text and not _is_unwanted_code_value(vendor_text, vendor_label):
         return _safe_name(vendor_text), "vendor"
 
     material_value = ws.cell(row_idx, material_col).value if material_col else None
-    material_text = str(material_value).strip() if material_value not in (None, "") else ""
+    material_text = _cell_text(material_value)
     material_label = _normalize_label(material_text)
-    if material_text and not _is_material_header_label(material_label):
+    if material_text and not _is_unwanted_code_value(material_text, material_label):
         return _safe_name("MAT_{0}".format(material_text)), "material"
 
     return None, None
@@ -1099,14 +1131,33 @@ def _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row):
     return row_map
 
 
-def _collect_target_rows(ws, start_row, vendor_col, material_col):
+def _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_col):
+    # Internal virtual "A + D(+F)" sheet: clean rows before naming/matching.
     rows = []
     max_row = ws.max_row or start_row
     for row_idx in range(start_row, max_row + 1):
-        code, _ = _row_code(ws, row_idx, vendor_col, material_col)
-        if code:
-            rows.append(row_idx)
+        code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
+        if not code:
+            continue
+        image_value = ws.cell(row_idx, image_col).value if image_col else None
+        image_text = _cell_text(image_value)
+        image_label = _normalize_label(image_text)
+        has_image_hint = bool(image_text) or image_label in {"image", "picture", "photo"} or (
+            isinstance(image_text, str) and "dispimg(" in image_text.lower()
+        )
+        rows.append(
+            {
+                "row": row_idx,
+                "code": code,
+                "code_source": code_source,
+                "has_image_hint": has_image_hint,
+            }
+        )
     return rows
+
+
+def _collect_target_rows(ws, start_row, image_col, vendor_col, material_col):
+    return [item["row"] for item in _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_col)]
 
 
 def _assign_entries_to_rows(target_rows, entries, image_col):
@@ -1256,7 +1307,8 @@ def extract_images():
     vendor_col = layout["vendor_col"]
     material_col = layout["material_col"]
     start_row = layout["start_row"]
-    target_rows = _collect_target_rows(ws, start_row, vendor_col, material_col)
+    internal_match_rows = _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_col)
+    target_rows = [item["row"] for item in internal_match_rows]
 
     openpyxl_images = list(getattr(ws, "_images", []) or [])
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
@@ -1403,8 +1455,15 @@ def extract_images():
                 if media_images:
                     extraction_mode = "media_order_fallback"
                     mapping_info["strategy"] = "order_media_to_rows"
-                    ordered_rows = sorted(target_rows)
+                    ordered_rows = [item["row"] for item in internal_match_rows]
+                    hint_rows = [item["row"] for item in internal_match_rows if item.get("has_image_hint")]
+                    if hint_rows and len(hint_rows) >= len(media_images):
+                        # When enough A-column hints exist, use them to avoid noisy vendor rows.
+                        ordered_rows = hint_rows
                     pair_count = min(len(ordered_rows), len(media_images))
+                    skipped_reasons.append(
+                        "Using media-order fallback on cleaned A+D rows. [build: {0}]".format(BUILD_TAG)
+                    )
 
                     for idx in range(pair_count):
                         row_idx = ordered_rows[idx]
@@ -1464,7 +1523,7 @@ def extract_images():
                     skipped_count += len(target_rows)
                     skipped_reasons.append(
                         "No row-anchored images found for target rows and no media images were available. "
-                        "Strict mode cannot assign names. [build: strict-v11]"
+                        "Strict mode cannot assign names. [build: {0}]".format(BUILD_TAG)
                     )
                     skipped_reasons.append(
                         "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
@@ -1508,12 +1567,17 @@ def extract_images():
                 "Generated at: {0}Z".format(datetime.utcnow().isoformat()),
                 "Sheet: {0}".format(sheet_name),
                 "Workbook file: {0}".format(original_filename or ""),
+                "Build tag: {0}".format(BUILD_TAG),
                 "Output root folder: {0}".format(root_folder),
                 "Extraction mode: {0}".format(extraction_mode),
                 "Detected image column: {0}".format(image_col),
                 "Detected vendor column: {0}".format(vendor_col),
                 "Detected material column: {0}".format(material_col or "none"),
                 "Data start row: {0}".format(start_row),
+                "Internal A+D clean rows: {0}".format(len(internal_match_rows)),
+                "Internal rows with A-column hints: {0}".format(
+                    len([item for item in internal_match_rows if item.get("has_image_hint")])
+                ),
                 "Vendor/material target rows: {0}".format(len(target_rows)),
                 "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
                 "Sheet-related row-anchored entries: {0}".format(len(related_anchor_entries)),
@@ -1536,6 +1600,7 @@ def extract_images():
                 "",
                 "Rules:",
                 "- Primary mode is strict same-row mapping: vendor/material row N uses image row N.",
+                "- Matching rows are first cleaned internally from columns A + D (+F fallback) to remove headers/noise.",
                 "- Row mapping starts after detected header rows.",
                 "- No nearest-row guessing and no offset guessing in strict mode.",
                 "- If no row anchors are recoverable, fallback maps rows and media by order (top-to-bottom).",
