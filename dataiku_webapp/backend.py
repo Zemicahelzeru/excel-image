@@ -29,6 +29,8 @@ MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 FIXED_IMAGE_COL = 1  # Column A
 FIXED_VENDOR_COL = 4  # Column D
 FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
+EMU_PER_POINT = 12700
+DEFAULT_ROW_HEIGHT_POINTS = 15.0
 
 
 def _json_error(message, status_code=400):
@@ -263,12 +265,11 @@ def _detect_layout(ws):
 
     # Do not use max(header_rows): image cells can contain "Picture" text lower in the sheet
     # and would incorrectly shift every target row downward.
-    if vendor_header_row is not None:
+    if vendor_header_row is not None and vendor_header_row <= 5:
         start_row = vendor_header_row + 1
     else:
-        # If vendor header is not explicit, default to row 2 to avoid accidental
-        # offsets from random "image/material" words in data rows.
-        start_row = 2
+        # Avoid accidental offsets from late header-like text in data rows.
+        start_row = 1
 
     material_col = FIXED_MATERIAL_COL if (ws.max_column or 0) >= FIXED_MATERIAL_COL else None
     return {
@@ -365,7 +366,7 @@ def _sheet_path_for_name(archive, sheet_name):
     return None
 
 
-def _extract_drawing_images_for_sheet(file_bytes, sheet_name):
+def _extract_drawing_images_for_sheet(file_bytes, sheet_name, ws=None):
     ns = {
         "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
         "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -405,10 +406,26 @@ def _extract_drawing_images_for_sheet(file_bytes, sheet_name):
             )
             drawing_rels = _read_relationships(archive, drawing_rels_path)
 
-            for anchor in drawing_root.findall("xdr:twoCellAnchor", ns) + drawing_root.findall(
-                "xdr:oneCellAnchor", ns
-            ):
-                row, col = _anchor_row_col_from_node(anchor, start_row=None)
+            drawing_anchors = (
+                drawing_root.findall("xdr:twoCellAnchor", ns)
+                + drawing_root.findall("xdr:oneCellAnchor", ns)
+                + drawing_root.findall("xdr:absoluteAnchor", ns)
+            )
+            for anchor in drawing_anchors:
+                local_name = _xml_local_name(getattr(anchor, "tag", "")).lower()
+                row = None
+                col = None
+                if local_name in {"onecellanchor", "twocellanchor"}:
+                    row, col = _anchor_row_col_from_node(anchor, start_row=None)
+                elif local_name == "absoluteanchor":
+                    pos_node = anchor.find("xdr:pos", ns)
+                    if pos_node is None:
+                        for child in anchor:
+                            if _xml_local_name(getattr(child, "tag", "")).lower() == "pos":
+                                pos_node = child
+                                break
+                    y_text = pos_node.attrib.get("y") if pos_node is not None else None
+                    row = _row_from_y_emu(ws, y_text)
 
                 blip = anchor.find(".//a:blip", ns)
                 if blip is None:
@@ -562,31 +579,61 @@ def _cell_ref_to_row_col(cell_ref):
     return row_idx, col_idx
 
 
+def _row_height_points(ws, row_idx):
+    if ws is None:
+        return DEFAULT_ROW_HEIGHT_POINTS
+    default_height = (
+        getattr(getattr(ws, "sheet_format", None), "defaultRowHeight", None)
+        or DEFAULT_ROW_HEIGHT_POINTS
+    )
+    try:
+        dim = ws.row_dimensions.get(row_idx)
+    except Exception:
+        dim = None
+    height = getattr(dim, "height", None) if dim is not None else None
+    if height in (None, 0):
+        return float(default_height)
+    try:
+        return float(height)
+    except Exception:
+        return float(default_height)
+
+
+def _row_from_y_emu(ws, y_emu):
+    if ws is None or y_emu is None:
+        return None
+    try:
+        y_value = int(y_emu)
+    except Exception:
+        return None
+    if y_value < 0:
+        y_value = 0
+
+    max_row = (ws.max_row or 1) + 500
+    cumulative = 0.0
+    for row_idx in range(1, max_row + 1):
+        row_height_emu = _row_height_points(ws, row_idx) * EMU_PER_POINT
+        cumulative += row_height_emu
+        if y_value < cumulative:
+            return row_idx
+    return None
+
+
 def _anchor_row_col_from_node(anchor, start_row=None):
     row = None
     col = None
 
-    # Prefer direct child lookup; fallback to deep scan for non-standard XML wrappers.
+    # Find the "from" marker regardless of namespace prefix.
     from_node = None
     try:
-        direct_children = list(anchor)
+        iterator = anchor.iter()
     except Exception:
-        direct_children = []
-    for child in direct_children:
-        child_tag = getattr(child, "tag", None)
-        if child_tag is not None and _xml_local_name(child_tag).lower() == "from":
+        iterator = []
+    for child in iterator:
+        child_tag = getattr(child, "tag", "")
+        if "from" in str(child_tag).lower():
             from_node = child
             break
-    if from_node is None:
-        try:
-            iterator = anchor.iter()
-        except Exception:
-            iterator = []
-        for child in iterator:
-            child_tag = getattr(child, "tag", None)
-            if child_tag is not None and _xml_local_name(child_tag).lower() == "from":
-                from_node = child
-                break
     if from_node is None:
         return None, None
 
@@ -607,9 +654,8 @@ def _anchor_row_col_from_node(anchor, start_row=None):
             except Exception:
                 col = None
 
-    if row is not None and (start_row is None or row >= start_row):
-        return row, col
-    return None, None
+    # Keep exact extracted coordinates; strict mapping happens in assignment stage.
+    return row, col
 
 
 def _extract_dispimg_key(formula):
@@ -959,48 +1005,6 @@ def _extract_dispimg_row_keys(file_bytes, sheet_name, image_col, start_row):
     return row_map
 
 
-def _build_dispimg_sequence_entries(row_key_map, image_col, media_images):
-    if not row_key_map or not media_images:
-        return []
-
-    ordered_rows = sorted(row_key_map.keys())
-    ordered_keys = []
-    seen_keys = set()
-    for row_idx in ordered_rows:
-        norm_key = _normalize_mapping_key(row_key_map.get(row_idx))
-        if not norm_key or norm_key in seen_keys:
-            continue
-        seen_keys.add(norm_key)
-        ordered_keys.append(norm_key)
-
-    # Safety gate: only use sequence mapping if unique DISPIMG keys and media count
-    # match exactly. This avoids offset drift.
-    if not ordered_keys or len(ordered_keys) != len(media_images):
-        return []
-
-    key_to_media = {
-        key: media_images[idx]
-        for idx, key in enumerate(ordered_keys)
-    }
-
-    entries = []
-    for row_idx in ordered_rows:
-        norm_key = _normalize_mapping_key(row_key_map.get(row_idx))
-        media = key_to_media.get(norm_key)
-        if not media:
-            continue
-        entries.append(
-            {
-                "row": row_idx,
-                "col": image_col,
-                "ext": media["ext"],
-                "data": media["data"],
-                "source": "dispimg_seq:{0}".format(norm_key or row_idx),
-            }
-        )
-    return entries
-
-
 def _collect_target_rows(ws, start_row, vendor_col, material_col):
     rows = []
     max_row = ws.max_row or start_row
@@ -1013,7 +1017,7 @@ def _collect_target_rows(ws, start_row, vendor_col, material_col):
 
 def _assign_entries_to_rows(target_rows, entries, image_col):
     diagnostics = {
-        "strategy": "strict_only",
+        "strategy": "strict_coordinate",
         "exact_row_matches": 0,
         "strict_col_matches": 0,
         "missing_rows": [],
@@ -1022,17 +1026,8 @@ def _assign_entries_to_rows(target_rows, entries, image_col):
         diagnostics["missing_rows"] = sorted(target_rows or [])
         return [], diagnostics
 
-    strict_map = {}
-    for entry in entries:
-        row = entry.get("row")
-        col = entry.get("col")
-        if row is None:
-            continue
-        # Accept exact image column or unknown anchor column, but never a different row.
-        if col not in (None, image_col):
-            continue
-        if row not in strict_map:
-            strict_map[row] = entry
+    # Strict coordinate mapping: row-id -> image entry.
+    strict_map = {entry["row"]: entry for entry in entries if entry.get("row") is not None}
 
     mapped = []
     missing_rows = []
@@ -1160,7 +1155,7 @@ def extract_images():
 
     openpyxl_images = list(getattr(ws, "_images", []) or [])
     openpyxl_entries = _extract_openpyxl_images(openpyxl_images)
-    drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name)
+    drawing_entries = _extract_drawing_images_for_sheet(file_bytes, sheet_name, ws=ws)
     related_anchor_entries = _extract_sheet_related_anchor_images(file_bytes, sheet_name, start_row)
     dispimg_entries = _extract_dispimg_entries(file_bytes, sheet_name, image_col, start_row)
     cellimages_anchor_entries = _extract_cellimages_anchor_entries(file_bytes, image_col, start_row)
@@ -1173,13 +1168,6 @@ def extract_images():
             if _normalize_mapping_key(value)
         }
     )
-    dispimg_sequence_entries = []
-    if not dispimg_entries and dispimg_row_keys and media_images:
-        dispimg_sequence_entries = _build_dispimg_sequence_entries(
-            dispimg_row_keys,
-            image_col,
-            media_images,
-        )
 
     extracted_count = 0
     skipped_count = 0
@@ -1212,9 +1200,6 @@ def extract_images():
             if dispimg_entries:
                 source_entries = dispimg_entries
                 extraction_mode = "dispimg_cellimages"
-            elif dispimg_sequence_entries:
-                source_entries = dispimg_sequence_entries
-                extraction_mode = "dispimg_key_sequence_media"
             elif related_anchor_entries:
                 source_entries = related_anchor_entries
                 extraction_mode = "sheet_related_anchor"
@@ -1260,6 +1245,24 @@ def extract_images():
                 for row_idx, entry in mapped_rows:
                     _write_entry_for_row(row_idx, entry)
 
+                # Report anchors that were found but do not belong to vendor/material rows.
+                target_set = set(target_rows)
+                non_target_anchor_rows = sorted(
+                    {
+                        entry.get("row")
+                        for entry in source_entries
+                        if entry.get("row") is not None and entry.get("row") not in target_set
+                    }
+                )
+                if non_target_anchor_rows:
+                    preview_extra = ",".join(str(r) for r in non_target_anchor_rows[:20])
+                    skipped_reasons.append(
+                        "Found image anchors on non-target rows: {0}{1}".format(
+                            preview_extra,
+                            "..." if len(non_target_anchor_rows) > 20 else "",
+                        )
+                    )
+
                 missing_rows = mapping_info.get("missing_rows") or []
                 if missing_rows:
                     extraction_mode = "strict_row_locked_missing_rows"
@@ -1282,15 +1285,16 @@ def extract_images():
                 skipped_count += len(target_rows)
                 skipped_reasons.append(
                     "No row-anchored images found for target rows. "
-                    "Strict mode forbids row-order or code-order guessing. [build: strict-v7]"
+                    "Strict mode forbids row-order or code-order guessing. [build: strict-v8]"
                 )
                 skipped_reasons.append(
                     "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
-                    "media images={2}, DISPIMG key-sequence entries={3}.".format(
+                    "media images={2}, drawing anchors={3}, openpyxl anchors={4}.".format(
                         len(dispimg_row_keys),
                         unique_dispimg_keys,
                         len(media_images),
-                        len(dispimg_sequence_entries),
+                        len(drawing_entries),
+                        len(openpyxl_entries),
                     )
                 )
 
@@ -1330,7 +1334,6 @@ def extract_images():
                 "Data start row: {0}".format(start_row),
                 "Vendor/material target rows: {0}".format(len(target_rows)),
                 "DISPIMG/cellimages entries: {0}".format(len(dispimg_entries)),
-                "DISPIMG key-sequence entries: {0}".format(len(dispimg_sequence_entries)),
                 "Sheet-related row-anchored entries: {0}".format(len(related_anchor_entries)),
                 "Cellimages row-anchored entries: {0}".format(len(cellimages_anchor_entries)),
                 "DISPIMG formula rows in image column: {0}".format(len(dispimg_row_keys)),
@@ -1350,7 +1353,7 @@ def extract_images():
                 "- Row mapping starts after detected header rows.",
                 "- No nearest-row guessing and no offset guessing.",
                 "- No row-order fallback and no code-group fallback are allowed.",
-                "- If DISPIMG keys exist and unique-key count matches media count, mapping may use DISPIMG key sequence.",
+                "- Images anchored to non-target rows are never reassigned to a different row.",
                 "- Rows without anchored images are reported as missing.",
                 "- Preferred name is Vendor Material from detected vendor column.",
                 "- If Vendor is empty and Original Material exists, file uses MAT_<material>.",
