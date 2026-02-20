@@ -1309,14 +1309,15 @@ def extract_images():
                 skipped_count += len(target_rows)
                 skipped_reasons.append(
                     "No row-anchored images found for target rows. "
-                    "Strict mode forbids row-order or code-order guessing. [build: strict-v8]"
+                    "Strict mode forbids row-order or code-order guessing. [build: strict-v9]"
                 )
                 skipped_reasons.append(
                     "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
-                    "media images={2}, drawing anchors={3}, openpyxl anchors={4}.".format(
+                    "media images={2}, sheet-related anchors={3}, drawing anchors={4}, openpyxl anchors={5}.".format(
                         len(dispimg_row_keys),
                         unique_dispimg_keys,
                         len(media_images),
+                        len(related_anchor_entries),
                         len(drawing_entries),
                         len(openpyxl_entries),
                     )
