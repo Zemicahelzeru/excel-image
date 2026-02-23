@@ -229,6 +229,25 @@ def _is_unwanted_code_value(text, label):
     if _is_vendor_header_label(label) or _is_material_header_label(label) or _is_image_header_label(label):
         return True
 
+    # Guardrail: reject header/title-like values in vendor/material cells.
+    # This prevents names like "Vendor", "Material", "Item Code", etc.
+    header_like_tokens = (
+        "vendor",
+        "material",
+        "item code",
+        "item",
+        "product code",
+        "product",
+        "code",
+        "image",
+        "picture",
+        "photo",
+        "title",
+        "header",
+    )
+    if any(token in label for token in header_like_tokens) and not re.search(r"\d", text):
+        return True
+
     noisy_tokens = (
         "description",
         "remark",
@@ -326,11 +345,11 @@ def _detect_layout(ws):
 
     # Do not use max(header_rows): image cells can contain "Picture" text lower in the sheet
     # and would incorrectly shift every target row downward.
-    if vendor_header_row is not None and vendor_header_row <= 5:
+    if vendor_header_row is not None and vendor_header_row <= 10:
         start_row = vendor_header_row + 1
     else:
-        # Avoid accidental offsets from late header-like text in data rows.
-        start_row = 1
+        # Be conservative when header is unclear: skip row 1, which is usually title/header.
+        start_row = 2
 
     material_col = FIXED_MATERIAL_COL if (ws.max_column or 0) >= FIXED_MATERIAL_COL else None
     return {
@@ -1210,7 +1229,7 @@ def _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_co
         image_value = ws.cell(row_idx, image_col).value if image_col else None
         image_text = _cell_text(image_value)
         image_label = _normalize_label(image_text)
-        has_image_hint = bool(image_text) or image_label in {"image", "picture", "photo"} or (
+        has_image_hint = image_label in {"image", "picture", "photo"} or (
             isinstance(image_text, str) and "dispimg(" in image_text.lower()
         )
         rows.append(
