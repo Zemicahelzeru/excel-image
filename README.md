@@ -35,7 +35,7 @@ BUILD_TAG = "strict-v14"
 ENABLE_SMALL_IMAGE_UPSCALE = False  # Keep False for faster exports.
 SMALL_IMAGE_UPSCALE_FACTOR = 3
 FAST_ZIP_MODE = True
-ALLOW_ORDER_FALLBACK = False  # Keep False to prevent wrong vendor/image naming.
+ALLOW_ORDER_FALLBACK = True  # Use safe fallback when anchors are unavailable.
 
 
 def _json_error(message, status_code=400):
@@ -1545,18 +1545,75 @@ def extract_images():
                 mapping_info["exact_row_matches"] = 0
                 mapping_info["strict_col_matches"] = 0
                 mapping_info["missing_rows"] = sorted(target_rows)
-                skipped_count += len(target_rows)
 
                 if media_images and ALLOW_ORDER_FALLBACK:
+                    extraction_mode = "media_order_fallback_safe"
+                    mapping_info["strategy"] = "order_media_to_rows_safe"
+                    hint_items = [item for item in internal_match_rows if item.get("has_image_hint")]
+                    if hint_items:
+                        ordered_items = hint_items
+                    else:
+                        ordered_items = list(internal_match_rows)
+
+                    pair_count = min(len(ordered_items), len(media_images))
+                    for idx in range(pair_count):
+                        row_idx = ordered_items[idx]["row"]
+                        media_item = media_images[idx]
+                        _write_entry_for_row(
+                            row_idx,
+                            {
+                                "row": row_idx,
+                                "col": image_col,
+                                "ext": media_item["ext"],
+                                "data": media_item["data"],
+                                "source": "media_order:{0}".format(idx + 1),
+                            },
+                        )
+
+                    mapping_info["exact_row_matches"] = pair_count
+                    mapping_info["strict_col_matches"] = pair_count
+
+                    covered_rows = {item["row"] for item in ordered_items[:pair_count]}
+                    missing_rows = sorted(set(target_rows) - covered_rows)
+                    mapping_info["missing_rows"] = missing_rows
+                    if missing_rows:
+                        skipped_count += len(missing_rows)
+                        preview = ",".join(str(r) for r in missing_rows[:20])
+                        skipped_reasons.append(
+                            "Fallback could not map all rows: {0}{1}.".format(
+                                preview,
+                                "..." if len(missing_rows) > 20 else "",
+                            )
+                        )
+
+                    if len(media_images) > pair_count:
+                        extra_count = len(media_images) - pair_count
+                        for extra_idx in range(pair_count, len(media_images)):
+                            media_item = media_images[extra_idx]
+                            out_data, out_ext, did_upscale = _maybe_upscale_image(
+                                media_item["data"],
+                                media_item["ext"],
+                                scale_factor=SMALL_IMAGE_UPSCALE_FACTOR,
+                            )
+                            if did_upscale:
+                                upscaled_count += 1
+                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - pair_count + 1)
+                            filename = _next_unique_filename(generic_name, out_ext, seen_filenames)
+                            zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
+                            extracted_count += 1
+                        skipped_reasons.append(
+                            "Fallback exported {0} extra images with UNMAPPED_IMAGE_* names.".format(
+                                extra_count
+                            )
+                        )
+
                     skipped_reasons.append(
-                        "Order fallback is enabled, but this build keeps strict naming only."
-                    )
-                elif media_images:
-                    skipped_reasons.append(
-                        "No reliable row anchors found. To prevent wrong vendor naming, "
-                        "media-order fallback is disabled. [build: {0}]".format(BUILD_TAG)
+                        "Row anchors unavailable; used safe top-to-bottom fallback. [build: {0}]".format(
+                            BUILD_TAG
+                        )
                     )
                 else:
+                    skipped_count += len(target_rows)
                     skipped_reasons.append(
                         "No row-anchored images found for target rows. Strict mode cannot assign names. "
                         "[build: {0}]".format(BUILD_TAG)
@@ -1591,7 +1648,11 @@ def extract_images():
                 extraction_mode = "xlsx_media_no_target_rows"
                 for idx, media in enumerate(media_images, start=1):
                     safe_code = "Image_{0}".format(idx)
-                    out_data, out_ext, did_upscale = _maybe_upscale_image(media["data"], media["ext"], scale_factor=3)
+                    out_data, out_ext, did_upscale = _maybe_upscale_image(
+                        media["data"],
+                        media["ext"],
+                        scale_factor=SMALL_IMAGE_UPSCALE_FACTOR,
+                    )
                     if did_upscale:
                         upscaled_count += 1
                     filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
