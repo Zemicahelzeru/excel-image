@@ -31,8 +31,8 @@ FIXED_VENDOR_COL = 4  # Column D
 FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
 EMU_PER_POINT = 12700
 DEFAULT_ROW_HEIGHT_POINTS = 15.0
-BUILD_TAG = "strict-v14"
-ENABLE_SMALL_IMAGE_UPSCALE = False  # Keep False for faster exports.
+BUILD_TAG = "strict-v15"
+ENABLE_SMALL_IMAGE_UPSCALE = True  # Restore previous image sizing behavior.
 SMALL_IMAGE_UPSCALE_FACTOR = 3
 FAST_ZIP_MODE = True
 ALLOW_ORDER_FALLBACK = True  # Use safe fallback when anchors are unavailable.
@@ -130,13 +130,22 @@ def _next_unique_filename(base_name, ext, seen):
 
 def _next_indexed_filename(base_name, ext, base_counts, seen):
     """
-    Return base_name_1.ext, base_name_2.ext, ... for repeated vendor codes.
+    Return base_name.ext first, then base_name_1.ext, base_name_2.ext...
     """
-    next_idx = base_counts.get(base_name, 0) + 1
+    used_count = base_counts.get(base_name, 0)
+    if used_count == 0:
+        candidate = "{0}.{1}".format(base_name, ext)
+        if candidate not in seen:
+            base_counts[base_name] = 1
+            seen.add(candidate)
+            return candidate
+        next_idx = 1
+    else:
+        next_idx = used_count
     while True:
         candidate = "{0}_{1}.{2}".format(base_name, next_idx, ext)
         if candidate not in seen:
-            base_counts[base_name] = next_idx
+            base_counts[base_name] = next_idx + 1
             seen.add(candidate)
             return candidate
         next_idx += 1
@@ -1469,7 +1478,11 @@ def extract_images():
                 cache_key = entry.get("source") or id(entry)
                 if cache_key in image_cache:
                     return image_cache[cache_key]
-                new_data, new_ext, did_upscale = _maybe_upscale_image(entry["data"], entry["ext"], scale_factor=3)
+                new_data, new_ext, did_upscale = _maybe_upscale_image(
+                    entry["data"],
+                    entry["ext"],
+                    scale_factor=SMALL_IMAGE_UPSCALE_FACTOR,
+                )
                 image_cache[cache_key] = (new_data, new_ext, did_upscale)
                 return image_cache[cache_key]
             def _write_entry_for_row(row_idx, entry):
@@ -1555,10 +1568,24 @@ def extract_images():
                     else:
                         ordered_items = list(internal_match_rows)
 
-                    pair_count = min(len(ordered_items), len(media_images))
-                    for idx in range(pair_count):
-                        row_idx = ordered_items[idx]["row"]
-                        media_item = media_images[idx]
+                    code_to_media_idx = {}
+                    next_media_idx = 0
+                    mapped_rows = []
+                    for item in ordered_items:
+                        row_idx = item["row"]
+                        code = item.get("code")
+
+                        if code and code in code_to_media_idx:
+                            media_idx = code_to_media_idx[code]
+                        else:
+                            if next_media_idx >= len(media_images):
+                                break
+                            media_idx = next_media_idx
+                            next_media_idx += 1
+                            if code:
+                                code_to_media_idx[code] = media_idx
+
+                        media_item = media_images[media_idx]
                         _write_entry_for_row(
                             row_idx,
                             {
@@ -1566,14 +1593,16 @@ def extract_images():
                                 "col": image_col,
                                 "ext": media_item["ext"],
                                 "data": media_item["data"],
-                                "source": "media_order:{0}".format(idx + 1),
+                                "source": "media_order:{0}".format(media_idx + 1),
                             },
                         )
+                        mapped_rows.append(row_idx)
 
+                    pair_count = len(mapped_rows)
                     mapping_info["exact_row_matches"] = pair_count
                     mapping_info["strict_col_matches"] = pair_count
 
-                    covered_rows = {item["row"] for item in ordered_items[:pair_count]}
+                    covered_rows = set(mapped_rows)
                     missing_rows = sorted(set(target_rows) - covered_rows)
                     mapping_info["missing_rows"] = missing_rows
                     if missing_rows:
@@ -1586,9 +1615,9 @@ def extract_images():
                             )
                         )
 
-                    if len(media_images) > pair_count:
-                        extra_count = len(media_images) - pair_count
-                        for extra_idx in range(pair_count, len(media_images)):
+                    if len(media_images) > next_media_idx:
+                        extra_count = len(media_images) - next_media_idx
+                        for extra_idx in range(next_media_idx, len(media_images)):
                             media_item = media_images[extra_idx]
                             out_data, out_ext, did_upscale = _maybe_upscale_image(
                                 media_item["data"],
@@ -1597,7 +1626,7 @@ def extract_images():
                             )
                             if did_upscale:
                                 upscaled_count += 1
-                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - pair_count + 1)
+                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - next_media_idx + 1)
                             filename = _next_unique_filename(generic_name, out_ext, seen_filenames)
                             zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                             extracted_count += 1
