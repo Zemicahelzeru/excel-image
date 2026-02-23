@@ -132,23 +132,17 @@ def _next_indexed_filename(base_name, ext, base_counts, seen):
     """
     Return base_name.ext first, then base_name_1.ext, base_name_2.ext...
     """
-    used_count = base_counts.get(base_name, 0)
-    if used_count == 0:
-        candidate = "{0}.{1}".format(base_name, ext)
-        if candidate not in seen:
-            base_counts[base_name] = 1
-            seen.add(candidate)
-            return candidate
-        next_idx = 1
-    else:
-        next_idx = used_count
+    next_occurrence = base_counts.get(base_name, 0)
     while True:
-        candidate = "{0}_{1}.{2}".format(base_name, next_idx, ext)
+        if next_occurrence == 0:
+            candidate = "{0}.{1}".format(base_name, ext)
+        else:
+            candidate = "{0}_{1}.{2}".format(base_name, next_occurrence, ext)
         if candidate not in seen:
-            base_counts[base_name] = next_idx + 1
             seen.add(candidate)
+            base_counts[base_name] = next_occurrence + 1
             return candidate
-        next_idx += 1
+        next_occurrence += 1
 
 
 def _natural_sort_key(text):
