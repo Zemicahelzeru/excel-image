@@ -1556,29 +1556,47 @@ def extract_images():
                 if media_images and ALLOW_ORDER_FALLBACK:
                     extraction_mode = "media_order_fallback_safe"
                     mapping_info["strategy"] = "order_media_to_rows_safe"
-                    hint_items = [item for item in internal_match_rows if item.get("has_image_hint")]
-                    if hint_items:
-                        ordered_items = hint_items
-                    else:
-                        ordered_items = list(internal_match_rows)
+                    ordered_items = list(internal_match_rows)
+
+                    # Prefer reliable representative rows per code (DISPIMG row first, then image-hint row).
+                    dispimg_rows = set(dispimg_row_keys.keys()) if dispimg_row_keys else set()
+                    items_by_code = {}
+                    code_order = []
+                    for item in ordered_items:
+                        code = item.get("code")
+                        if not code:
+                            continue
+                        if code not in items_by_code:
+                            items_by_code[code] = []
+                            code_order.append(code)
+                        items_by_code[code].append(item)
+
+                    def _row_priority(code_item):
+                        row_idx = code_item.get("row") or 10**9
+                        in_dispimg = 0 if row_idx in dispimg_rows else 1
+                        has_hint = 0 if code_item.get("has_image_hint") else 1
+                        return (in_dispimg, has_hint, row_idx)
 
                     code_to_media_idx = {}
                     next_media_idx = 0
+                    for code in code_order:
+                        code_items = items_by_code.get(code) or []
+                        if not code_items:
+                            continue
+                        # Sort only to choose the best representative row for this code.
+                        code_items.sort(key=_row_priority)
+                        if next_media_idx >= len(media_images):
+                            break
+                        code_to_media_idx[code] = next_media_idx
+                        next_media_idx += 1
+
                     mapped_rows = []
                     for item in ordered_items:
                         row_idx = item["row"]
                         code = item.get("code")
-
-                        if code and code in code_to_media_idx:
-                            media_idx = code_to_media_idx[code]
-                        else:
-                            if next_media_idx >= len(media_images):
-                                break
-                            media_idx = next_media_idx
-                            next_media_idx += 1
-                            if code:
-                                code_to_media_idx[code] = media_idx
-
+                        if not code or code not in code_to_media_idx:
+                            continue
+                        media_idx = code_to_media_idx[code]
                         media_item = media_images[media_idx]
                         _write_entry_for_row(
                             row_idx,
