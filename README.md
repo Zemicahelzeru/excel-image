@@ -1257,6 +1257,79 @@ def _extract_media_images(file_bytes):
                 }
             )
     return media
+@app.route("/validate_image_column", methods=["POST"])
+def validate_image_column():
+    """Validate the pasted image column content against the Excel file."""
+    file_bytes, _filename, error = _get_uploaded_file()
+    if error:
+        return _json_error(error, 400)
+
+    sheet_name = (request.form.get("sheet_name") or "").strip()
+    image_column_content = (request.form.get("image_column_content") or "").strip()
+    
+    if not sheet_name:
+        return _json_error("Missing sheet_name", 400)
+    
+    if not image_column_content:
+        return _json_error("Missing image column content", 400)
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, keep_links=False)
+    except Exception as exc:
+        return _json_error(f"Could not open workbook: {exc}", 400)
+
+    if sheet_name not in wb.sheetnames:
+        wb.close()
+        return _json_error(f'Sheet "{sheet_name}" not found in workbook', 400)
+
+    ws = wb[sheet_name]
+    layout = _detect_layout(ws)
+    image_col = layout["image_col"]
+    vendor_col = layout["vendor_col"]
+    material_col = layout["material_col"]
+    start_row = layout["start_row"]
+
+    max_row = ws.max_row or 0
+    preview_items = []
+    rows_with_images = 0
+    empty_rows = 0
+    
+    for row_idx in range(start_row, max_row + 1):
+        cell_value = ws.cell(row_idx, image_col).value
+        cell_text = _cell_text(cell_value)
+        has_content = bool(cell_text)
+        
+        if has_content:
+            rows_with_images += 1
+        else:
+            empty_rows += 1
+
+        preview_items.append({
+            "row": row_idx,
+            "value": cell_text,
+            "has_content": has_content,
+        })
+
+    wb.close()
+
+    return jsonify(
+        status="ok",
+        message=f"✅ Found {len(preview_items)} rows with {rows_with_images} containing images",
+        details={
+            "items": preview_items,
+            "total_rows": len(preview_items),
+            "rows_with_images": rows_with_images,
+            "empty_rows": empty_rows,
+        },
+        image_column_data={
+            "rows": preview_items,
+            "start_row": start_row,
+            "image_col": image_col,
+            "vendor_col": vendor_col,
+            "material_col": material_col,
+        }
+    )
+
 
 
 @app.errorhandler(Exception)
