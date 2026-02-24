@@ -1,47 +1,231 @@
-<div class="header">
-    <div class="container">
-        <h1>Excel Image Extractor</h1>
-    </div>
-</div>
+:root {
+    --rl-navy: #041E42;
+    --rl-burgundy: #75263D;
+    --rl-gray: #F5F5F5;
+    --rl-border: #CCCCCC;
+}
 
-<div class="container">
-    <div class="card">
-        <div class="instructions">
-            <h2>Instructions</h2>
-            <ol>
-                <li>Upload your Excel file containing images</li>
-                <li>Select the sheet containing your images</li>
-                <li>Preview mapping to validate naming accuracy</li>
-                <li>Process to download ZIP with deterministic row-based names</li>
-            </ol>
-        </div>
-    </div>
+body {
+    font-family: "Founders Grotesk", Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+    background: var(--rl-gray);
+    color: #333333;
+}
 
-    <div class="card">
-        <div class="upload-form">
-            <form id="uploadForm">
-                <div class="file-input">
-                    <label for="excelFile" class="sr-only">Excel file</label>
-                    <input type="file" accept=".xlsx,.xlsm" required id="excelFile">
-                </div>
-                <button type="submit" class="button" id="uploadButton">Upload Excel File</button>
-            </form>
-        </div>
+.header {
+    background: var(--rl-navy);
+    color: #ffffff;
+    padding: 20px 0;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
 
-        <div class="sheet-selection" id="sheetSelection">
-            <h3>Select Sheet</h3>
-            <div class="sheet-list" id="sheetList"></div>
-            <div class="grid-actions">
-                <button type="button" class="button" id="previewMappingButton" disabled>Preview Mapping</button>
-                <button class="button" id="processButton" disabled>Process Selected Sheet</button>
-            </div>
-            <div id="mappingPreview" style="display:none;"></div>
-        </div>
+.container {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 0 20px;
+}
 
-        <div class="spinner" id="spinner" aria-hidden="true"></div>
-        <div class="progress-bar" id="progressBar" aria-hidden="true">
-            <div class="progress" id="progress"></div>
-        </div>
-        <div id="status" class="status" role="status" aria-live="polite"></div>
-    </div>
-</div>
+.card {
+    background: #ffffff;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    margin: 20px 0;
+    padding: 20px;
+}
+
+.instructions {
+    background: #E3F2FD;
+    border-left: 4px solid #2196F3;
+    padding: 15px;
+    margin: 20px 0;
+    border-radius: 4px;
+}
+
+.instructions h2 {
+    margin-top: 0;
+    color: var(--rl-navy);
+}
+
+.instructions ol {
+    padding-left: 20px;
+}
+
+.instructions li {
+    margin: 10px 0;
+}
+
+.upload-form {
+    border: 2px dashed var(--rl-border);
+    padding: 30px;
+    text-align: center;
+    margin: 20px 0;
+    border-radius: 8px;
+    background: #ffffff;
+}
+
+.sheet-selection {
+    display: none;
+    margin: 20px 0;
+}
+
+.sheet-list {
+    margin: 10px 0;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.sheet-option {
+    padding: 10px;
+    margin: 5px 0;
+    border: 1px solid var(--rl-border);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.sheet-option:hover {
+    background: var(--rl-gray);
+}
+
+.sheet-option.selected {
+    background: var(--rl-navy);
+    color: #ffffff;
+    border-color: var(--rl-navy);
+}
+
+.button {
+    background: var(--rl-navy);
+    color: #ffffff;
+    padding: 12px 24px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    transition: all 0.3s ease;
+}
+
+.button:hover {
+    background: #0a2e5c;
+}
+
+.button:disabled {
+    background: var(--rl-border);
+    cursor: not-allowed;
+}
+
+.btn-secondary {
+    background: #757575;
+}
+
+.btn-secondary:hover {
+    background: #616161;
+}
+
+.file-input {
+    margin-bottom: 15px;
+}
+
+.status {
+    margin: 20px 0;
+    padding: 15px;
+    border-radius: 4px;
+    min-height: 24px;
+}
+
+.status.error {
+    background: #FFEBEE;
+    color: #C62828;
+    border-left: 4px solid #C62828;
+}
+
+.status.success {
+    background: #E8F5E9;
+    color: #2E7D32;
+    border-left: 4px solid #2E7D32;
+}
+
+.status.info {
+    background: #E3F2FD;
+    color: #0D47A1;
+    border-left: 4px solid #1976D2;
+}
+
+.progress-bar {
+    width: 100%;
+    height: 4px;
+    background: var(--rl-gray);
+    margin: 20px 0;
+    display: none;
+}
+
+.progress {
+    width: 0%;
+    height: 100%;
+    background: var(--rl-navy);
+    transition: width 0.3s ease;
+}
+
+.spinner {
+    display: none;
+    width: 30px;
+    height: 30px;
+    border: 3px solid var(--rl-gray);
+    border-top: 3px solid var(--rl-navy);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin: 20px auto;
+}
+
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    border: 0;
+}
+
+.grid-actions {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+#mappingPreview {
+    margin: 12px 0;
+    padding: 12px;
+    border: 1px solid var(--rl-border);
+    border-radius: 6px;
+    background: #fff;
+}
+
+.preview-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-top: 8px;
+}
+
+.preview-table th,
+.preview-table td {
+    border: 1px solid var(--rl-border);
+    padding: 6px;
+    text-align: left;
+}
+
+.preview-warning {
+    color: #b00020;
+    font-weight: 600;
+}
+
+@keyframes spin {
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(360deg);
+    }
+}
