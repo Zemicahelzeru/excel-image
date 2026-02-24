@@ -31,11 +31,7 @@ FIXED_VENDOR_COL = 4  # Column D
 FIXED_MATERIAL_COL = 6  # Column F (fallback: ORIGINAL MATERIAL #)
 EMU_PER_POINT = 12700
 DEFAULT_ROW_HEIGHT_POINTS = 15.0
-BUILD_TAG = "strict-v15"
-ENABLE_SMALL_IMAGE_UPSCALE = True  # Restore previous image sizing behavior.
-SMALL_IMAGE_UPSCALE_FACTOR = 3
-FAST_ZIP_MODE = True
-ALLOW_ORDER_FALLBACK = True  # Use safe fallback when anchors are unavailable.
+BUILD_TAG = "strict-v13"
 
 
 def _json_error(message, status_code=400):
@@ -80,14 +76,6 @@ def _anchor_row_col(img):
         row = getattr(from_cell, "row", None)
         col = getattr(from_cell, "col", None)
         if isinstance(row, int) and isinstance(col, int):
-            row_off = getattr(from_cell, "rowOff", 0) or 0
-            to_cell = getattr(anchor, "_to", None)
-            if to_cell is not None:
-                to_row = getattr(to_cell, "row", None)
-                if isinstance(to_row, int) and to_row > row and row_off > 0:
-                    row += 1
-            elif row_off > 95000:
-                row += 1
             return row + 1, col + 1
 
     # Fallback for marker-like anchors that directly expose row/col.
@@ -126,23 +114,6 @@ def _next_unique_filename(base_name, ext, seen):
             seen.add(candidate)
             return candidate
         counter += 1
-
-
-def _next_indexed_filename(base_name, ext, base_counts, seen):
-    """
-    Return base_name.ext first, then base_name_1.ext, base_name_2.ext...
-    """
-    next_occurrence = base_counts.get(base_name, 0)
-    while True:
-        if next_occurrence == 0:
-            candidate = "{0}.{1}".format(base_name, ext)
-        else:
-            candidate = "{0}_{1}.{2}".format(base_name, next_occurrence, ext)
-        if candidate not in seen:
-            seen.add(candidate)
-            base_counts[base_name] = next_occurrence + 1
-            return candidate
-        next_occurrence += 1
 
 
 def _natural_sort_key(text):
@@ -227,25 +198,6 @@ def _is_unwanted_code_value(text, label):
     if label in {"n/a", "na", "none", "null", "-", "--"}:
         return True
     if _is_vendor_header_label(label) or _is_material_header_label(label) or _is_image_header_label(label):
-        return True
-
-    # Guardrail: reject header/title-like values in vendor/material cells.
-    # This prevents names like "Vendor", "Material", "Item Code", etc.
-    header_like_tokens = (
-        "vendor",
-        "material",
-        "item code",
-        "item",
-        "product code",
-        "product",
-        "code",
-        "image",
-        "picture",
-        "photo",
-        "title",
-        "header",
-    )
-    if any(token in label for token in header_like_tokens) and not re.search(r"\d", text):
         return True
 
     noisy_tokens = (
@@ -345,11 +297,11 @@ def _detect_layout(ws):
 
     # Do not use max(header_rows): image cells can contain "Picture" text lower in the sheet
     # and would incorrectly shift every target row downward.
-    if vendor_header_row is not None and vendor_header_row <= 10:
+    if vendor_header_row is not None and vendor_header_row <= 5:
         start_row = vendor_header_row + 1
     else:
-        # Be conservative when header is unclear: skip row 1, which is usually title/header.
-        start_row = 2
+        # Avoid accidental offsets from late header-like text in data rows.
+        start_row = 1
 
     material_col = FIXED_MATERIAL_COL if (ws.max_column or 0) >= FIXED_MATERIAL_COL else None
     return {
@@ -802,15 +754,14 @@ def _position_y_emu_from_anchor(anchor):
 def _anchor_row_col_from_node(anchor, start_row=None):
     row = None
     col = None
-    row_off = 0
 
     # Find the "from" marker regardless of namespace prefix.
     from_node = None
     try:
-        nodes = list(anchor.iter())
+        iterator = anchor.iter()
     except Exception:
-        nodes = []
-    for child in nodes:
+        iterator = []
+    for child in iterator:
         child_tag = getattr(child, "tag", "")
         if "from" in str(child_tag).lower():
             from_node = child
@@ -834,38 +785,6 @@ def _anchor_row_col_from_node(anchor, start_row=None):
                 col = int(text_value) + 1
             except Exception:
                 col = None
-        elif tag_name == "rowoff":
-            try:
-                row_off = int(text_value)
-            except Exception:
-                row_off = 0
-
-    # Adjust row when anchor top-left sits near previous row but image spills into next row.
-    to_row = None
-    to_node = None
-    for child in nodes:
-        child_tag = getattr(child, "tag", "")
-        if "to" in str(child_tag).lower():
-            to_node = child
-            break
-    if to_node is not None:
-        for part in to_node:
-            tag = getattr(part, "tag", None)
-            if tag is None:
-                continue
-            if _xml_local_name(tag).lower() != "row":
-                continue
-            try:
-                to_row = int((part.text or "").strip()) + 1
-            except Exception:
-                to_row = None
-            break
-
-    if isinstance(row, int):
-        if isinstance(to_row, int) and to_row > row and row_off > 0:
-            row += 1
-        elif row_off > 95000:
-            row += 1
 
     # Keep exact extracted coordinates; strict mapping happens in assignment stage.
     return row, col
@@ -1229,7 +1148,7 @@ def _build_internal_match_rows(ws, start_row, image_col, vendor_col, material_co
         image_value = ws.cell(row_idx, image_col).value if image_col else None
         image_text = _cell_text(image_value)
         image_label = _normalize_label(image_text)
-        has_image_hint = image_label in {"image", "picture", "photo"} or (
+        has_image_hint = bool(image_text) or image_label in {"image", "picture", "photo"} or (
             isinstance(image_text, str) and "dispimg(" in image_text.lower()
         )
         rows.append(
@@ -1296,8 +1215,6 @@ def _assign_entries_to_rows(target_rows, entries, image_col, ws, vendor_col, mat
     diagnostics["missing_rows"] = missing_rows
     return mapped, diagnostics
 def _maybe_upscale_image(data, ext, scale_factor=3):
-    if not ENABLE_SMALL_IMAGE_UPSCALE:
-        return data, ext, False
     if Image is None:
         return data, ext, False
 
@@ -1439,7 +1356,6 @@ def extract_images():
     skipped_count = 0
     skipped_reasons = []
     seen_filenames = set()
-    base_name_counts = {}
     extraction_mode = "none"
     upscaled_count = 0
     mapping_info = {
@@ -1463,8 +1379,7 @@ def extract_images():
     temp_file.close()
 
     try:
-        zip_compression = zipfile.ZIP_STORED if FAST_ZIP_MODE else zipfile.ZIP_DEFLATED
-        with zipfile.ZipFile(zip_path, "w", compression=zip_compression) as zip_file:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
             source_entries = []
             if dispimg_entries:
                 source_entries = dispimg_entries
@@ -1491,33 +1406,35 @@ def extract_images():
                 cache_key = entry.get("source") or id(entry)
                 if cache_key in image_cache:
                     return image_cache[cache_key]
-                new_data, new_ext, did_upscale = _maybe_upscale_image(
-                    entry["data"],
-                    entry["ext"],
-                    scale_factor=SMALL_IMAGE_UPSCALE_FACTOR,
-                )
+                new_data, new_ext, did_upscale = _maybe_upscale_image(entry["data"], entry["ext"], scale_factor=3)
                 image_cache[cache_key] = (new_data, new_ext, did_upscale)
                 return image_cache[cache_key]
             def _write_entry_for_row(row_idx, entry):
                 nonlocal extracted_count, upscaled_count
                 safe_code, code_source = _row_code(ws, row_idx, vendor_col, material_col)
-
-                # Vendor/material based naming; duplicates are indexed as _1, _2, _3...
+                
                 if safe_code:
-                    base_code = safe_code
+                    base_code = f"{safe_code}_R{row_idx}"  # Always append R{row_idx} to vendor code
                 else:
-                    base_code = "Row_{0}".format(row_idx)
-
+                    base_code = f"Row_{row_idx}"
+                    
+                if code_source == "material":
+                    skipped_reasons.append(
+                        "Row {0}: vendor missing, used material fallback MAT_.".format(row_idx)
+                    )
+                    
                 out_data, out_ext, did_upscale = _prepared_image(entry)
                 if did_upscale:
                     upscaled_count += 1
-
-                filename = _next_indexed_filename(
-                    base_code,
-                    out_ext,
-                    base_name_counts,
-                    seen_filenames,
-                )
+                    
+                filename = f"{base_code}.{out_ext}"
+                if filename in seen_filenames:
+                    counter = 1
+                    while f"{base_code}_{counter}.{out_ext}" in seen_filenames:
+                        counter += 1
+                    filename = f"{base_code}_{counter}.{out_ext}"
+                
+                seen_filenames.add(filename)
                 zip_file.writestr(f"{root_folder}/{filename}", out_data)
                 extracted_count += 1
             # Strict behavior: same row only (vendor/material row N -> image row N).
@@ -1566,56 +1483,38 @@ def extract_images():
                     skipped_count += len(missing_rows)
 
             elif target_rows:
-                extraction_mode = "strict_row_locked_no_row_anchors"
-                mapping_info["strategy"] = "strict_only_no_source_entries"
-                mapping_info["exact_row_matches"] = 0
-                mapping_info["strict_col_matches"] = 0
-                mapping_info["missing_rows"] = sorted(target_rows)
+                # User-requested fallback for files with no recoverable row anchors:
+                # pair vendor/material rows (top-to-bottom) with media images (natural order).
+                if media_images:
+                    extraction_mode = "media_order_fallback"
+                    mapping_info["strategy"] = "order_media_to_rows_full"
+                    hint_items = [item for item in internal_match_rows if item.get("has_image_hint")]
+                    if hint_items and len(hint_items) >= max(3, int(0.8 * len(internal_match_rows))):
+                        ordered_items = hint_items
+                    else:
+                        ordered_items = list(internal_match_rows)
 
-                if media_images and ALLOW_ORDER_FALLBACK:
-                    extraction_mode = "media_order_fallback_safe"
-                    mapping_info["strategy"] = "order_media_to_rows_safe"
-                    ordered_items = list(internal_match_rows)
-
-                    # Prefer reliable representative rows per code (DISPIMG row first, then image-hint row).
-                    dispimg_rows = set(dispimg_row_keys.keys()) if dispimg_row_keys else set()
-                    items_by_code = {}
-                    code_order = []
-                    for item in ordered_items:
-                        code = item.get("code")
-                        if not code:
-                            continue
-                        if code not in items_by_code:
-                            items_by_code[code] = []
-                            code_order.append(code)
-                        items_by_code[code].append(item)
-
-                    def _row_priority(code_item):
-                        row_idx = code_item.get("row") or 10**9
-                        in_dispimg = 0 if row_idx in dispimg_rows else 1
-                        has_hint = 0 if code_item.get("has_image_hint") else 1
-                        return (in_dispimg, has_hint, row_idx)
+                    skipped_reasons.append(
+                        "Using media-order fallback on cleaned A+D rows. [build: {0}]".format(BUILD_TAG)
+                    )
 
                     code_to_media_idx = {}
-                    next_media_idx = 0
-                    for code in code_order:
-                        code_items = items_by_code.get(code) or []
-                        if not code_items:
-                            continue
-                        # Sort only to choose the best representative row for this code.
-                        code_items.sort(key=_row_priority)
-                        if next_media_idx >= len(media_images):
-                            break
-                        code_to_media_idx[code] = next_media_idx
-                        next_media_idx += 1
-
-                    mapped_rows = []
-                    for item in ordered_items:
+                    reused_by_code_count = 0
+                    cycled_count = 0
+                    for idx, item in enumerate(ordered_items):
                         row_idx = item["row"]
                         code = item.get("code")
-                        if not code or code not in code_to_media_idx:
-                            continue
-                        media_idx = code_to_media_idx[code]
+                        if idx < len(media_images):
+                            media_idx = idx
+                        else:
+                            media_idx = code_to_media_idx.get(code)
+                            if media_idx is not None:
+                                reused_by_code_count += 1
+                            else:
+                                media_idx = idx % len(media_images)
+                                cycled_count += 1
+                        if code and code not in code_to_media_idx:
+                            code_to_media_idx[code] = media_idx
                         media_item = media_images[media_idx]
                         _write_entry_for_row(
                             row_idx,
@@ -1627,71 +1526,78 @@ def extract_images():
                                 "source": "media_order:{0}".format(media_idx + 1),
                             },
                         )
-                        mapped_rows.append(row_idx)
 
-                    pair_count = len(mapped_rows)
-                    mapping_info["exact_row_matches"] = pair_count
-                    mapping_info["strict_col_matches"] = pair_count
+                    mapping_info["exact_row_matches"] = len(ordered_items)
+                    mapping_info["strict_col_matches"] = len(ordered_items)
 
-                    covered_rows = set(mapped_rows)
+                    covered_rows = {item["row"] for item in ordered_items}
                     missing_rows = sorted(set(target_rows) - covered_rows)
                     mapping_info["missing_rows"] = missing_rows
                     if missing_rows:
                         skipped_count += len(missing_rows)
                         preview = ",".join(str(r) for r in missing_rows[:20])
                         skipped_reasons.append(
-                            "Fallback could not map all rows: {0}{1}.".format(
+                            "Clean-row filter skipped non-image/noise rows: {0}{1}.".format(
                                 preview,
                                 "..." if len(missing_rows) > 20 else "",
                             )
                         )
 
-                    if len(media_images) > next_media_idx:
-                        extra_count = len(media_images) - next_media_idx
-                        for extra_idx in range(next_media_idx, len(media_images)):
+                    if reused_by_code_count:
+                        skipped_reasons.append(
+                            "Order fallback reused image index by repeated vendor/material code on {0} rows.".format(
+                                reused_by_code_count
+                            )
+                        )
+                    if cycled_count:
+                        skipped_reasons.append(
+                            "Order fallback cycled media sequence for remaining {0} rows.".format(cycled_count)
+                        )
+
+                    extra_count = len(media_images) - len(ordered_items)
+                    if extra_count > 0:
+                        for extra_idx in range(len(ordered_items), len(media_images)):
                             media_item = media_images[extra_idx]
                             out_data, out_ext, did_upscale = _maybe_upscale_image(
                                 media_item["data"],
                                 media_item["ext"],
-                                scale_factor=SMALL_IMAGE_UPSCALE_FACTOR,
+                                scale_factor=3,
                             )
                             if did_upscale:
                                 upscaled_count += 1
-                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - next_media_idx + 1)
+                            generic_name = "UNMAPPED_IMAGE_{0}".format(extra_idx - len(ordered_items) + 1)
                             filename = _next_unique_filename(generic_name, out_ext, seen_filenames)
                             zip_file.writestr("{0}/{1}".format(root_folder, filename), out_data)
                             extracted_count += 1
                         skipped_reasons.append(
-                            "Fallback exported {0} extra images with UNMAPPED_IMAGE_* names.".format(
+                            "Order fallback: exported {0} extra images with UNMAPPED_IMAGE_* names.".format(
                                 extra_count
                             )
                         )
-
-                    skipped_reasons.append(
-                        "Row anchors unavailable; used safe top-to-bottom fallback. [build: {0}]".format(
-                            BUILD_TAG
-                        )
-                    )
                 else:
+                    extraction_mode = "strict_row_locked_no_row_anchors"
+                    mapping_info["strategy"] = "strict_only_no_source_entries"
+                    mapping_info["exact_row_matches"] = 0
+                    mapping_info["strict_col_matches"] = 0
+                    mapping_info["missing_rows"] = sorted(target_rows)
                     skipped_count += len(target_rows)
                     skipped_reasons.append(
-                        "No row-anchored images found for target rows. Strict mode cannot assign names. "
-                        "[build: {0}]".format(BUILD_TAG)
+                        "No row-anchored images found for target rows and no media images were available. "
+                        "Strict mode cannot assign names. [build: {0}]".format(BUILD_TAG)
                     )
-
-                skipped_reasons.append(
-                    "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
-                    "media images={2}, sheet-related anchors={3}, drawing anchors={4}, "
-                    "global drawing anchors={5}, openpyxl anchors={6}.".format(
-                        len(dispimg_row_keys),
-                        unique_dispimg_keys,
-                        len(media_images),
-                        len(related_anchor_entries),
-                        len(drawing_entries),
-                        len(global_drawing_entries),
-                        len(openpyxl_entries),
+                    skipped_reasons.append(
+                        "Diagnostics: DISPIMG rows={0}, unique DISPIMG keys={1}, "
+                        "media images={2}, sheet-related anchors={3}, drawing anchors={4}, "
+                        "global drawing anchors={5}, openpyxl anchors={6}.".format(
+                            len(dispimg_row_keys),
+                            unique_dispimg_keys,
+                            len(media_images),
+                            len(related_anchor_entries),
+                            len(drawing_entries),
+                            len(global_drawing_entries),
+                            len(openpyxl_entries),
+                        )
                     )
-                )
 
             # If no vendor/material rows were found, still export discovered images.
             elif source_entries:
@@ -1708,11 +1614,7 @@ def extract_images():
                 extraction_mode = "xlsx_media_no_target_rows"
                 for idx, media in enumerate(media_images, start=1):
                     safe_code = "Image_{0}".format(idx)
-                    out_data, out_ext, did_upscale = _maybe_upscale_image(
-                        media["data"],
-                        media["ext"],
-                        scale_factor=SMALL_IMAGE_UPSCALE_FACTOR,
-                    )
+                    out_data, out_ext, did_upscale = _maybe_upscale_image(media["data"], media["ext"], scale_factor=3)
                     if did_upscale:
                         upscaled_count += 1
                     filename = _next_unique_filename(safe_code, out_ext, seen_filenames)
