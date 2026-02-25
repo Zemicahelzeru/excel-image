@@ -1,478 +1,169 @@
 (function () {
   "use strict";
+  // Prevent double initialization
   if (window.__PASTE_GRID_APP_READY__) return;
   window.__PASTE_GRID_APP_READY__ = true;
 
+  // --- Utilities ---
   function apiUrl(path) {
     const normalized = path.startsWith("/") ? path : "/" + path;
-    if (typeof getWebAppBackendUrl === "function") {
-      return getWebAppBackendUrl(normalized);
-    }
-    return "backend" + normalized;
+    return (typeof getWebAppBackendUrl === "function") ? getWebAppBackendUrl(normalized) : "backend" + normalized;
   }
 
   function showStatus(message, type) {
     const status = document.getElementById("status");
     if (!status) return;
-    const kind = type || "info";
-    status.className = "status-" + kind;
+    status.className = "status-" + (type || "info");
     status.textContent = message;
   }
 
   function escapeHtml(text) {
-    return String(text)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
   }
 
+  // --- Renderers ---
   function imageRenderer(instance, td, row, col, prop, value) {
     if (value && typeof value === "string" && value.indexOf("data:image") === 0) {
-      td.innerHTML = '<div class="image-cell" style="background-image:url(' + escapeHtml(value) + ')"></div>';
+      td.innerHTML = '<div class="image-cell" style="background-image:url(' + escapeHtml(value) + '); width:50px; height:50px; background-size:contain; background-repeat:no-repeat;"></div>';
       return td;
     }
     Handsontable.renderers.TextRenderer.apply(this, arguments);
     return td;
   }
 
-  function parseImagesFromHtml(html) {
-    if (!html) return [];
-    const matches = html.match(/src\s*=\s*["'](data:image\/[^"']+)["']/gi) || [];
-    return matches
-      .map(function (m) {
-        const mm = m.match(/["'](data:image\/[^"']+)["']/i);
-        return mm ? mm[1] : null;
-      })
-      .filter(Boolean);
-  }
-
-  function setImagesSequentially(hot, startRow, dataUrls) {
-    dataUrls.forEach(function (url, idx) {
-      hot.setDataAtCell(startRow + idx, 0, url, "image-paste");
-    });
-  }
-
-  function handleClipboardPaste(e, hot) {
-    const selected = hot.getSelectedLast();
-    if (!selected) return;
-    const startRow = selected[0];
-    const startCol = selected[1];
-    if (startCol !== 0) return;
-
-    const html = e.clipboardData ? e.clipboardData.getData("text/html") : "";
-    const htmlImages = parseImagesFromHtml(html);
-    const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
-    const imageItems = items.filter(function (it) {
-      return it.type && it.type.indexOf("image/") === 0;
-    });
-
-    if (!htmlImages.length && !imageItems.length) return;
-    e.preventDefault();
-
-    if (htmlImages.length) {
-      setImagesSequentially(hot, startRow, htmlImages);
-      showStatus("Pasted " + htmlImages.length + " image(s).", "success");
-      return;
-    }
-
-    const dataUrls = new Array(imageItems.length);
-    let completed = 0;
-    imageItems.forEach(function (item, idx) {
-      const blob = item.getAsFile();
-      if (!blob) {
-        completed += 1;
-        return;
-      }
+  // --- Image Processing ---
+  async function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = function (event) {
-        dataUrls[idx] = event.target.result;
-        completed += 1;
-        if (completed === imageItems.length) {
-          const ordered = dataUrls.filter(Boolean);
-          setImagesSequentially(hot, startRow, ordered);
-          showStatus("Pasted " + ordered.length + " image(s).", "success");
-        }
-      };
-      reader.onerror = function () {
-        completed += 1;
-        if (completed === imageItems.length) {
-          const ordered = dataUrls.filter(Boolean);
-          setImagesSequentially(hot, startRow, ordered);
-          showStatus("Some images could not be read from clipboard.", "error");
-        }
-      };
-      reader.readAsDataURL(blob);
-    });
-  }
-
-  function buildRowsForBackend(rawData) {
-    const rows = [];
-    rawData.forEach(function (row, idx) {
-      const image = row[0];
-      const vendor = (row[1] || "").toString().trim();
-      if (!image || !vendor) return;
-      rows.push({
-        row_number: idx + 1,
-        image_data_url: image,
-        vendor_code: vendor
-      });
-    });
-    return rows;
-  }
-
-  function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename || "vendor_images.zip";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
-  function processData() {
-    const hot = window.hotInstance;
-    if (!hot) return;
-    const rows = buildRowsForBackend(hot.getData());
-    if (!rows.length) {
-      showStatus("Need both image (A) and vendor code (B) in at least one row.", "error");
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append("data", JSON.stringify(rows));
-    showStatus("Generating ZIP...", "info");
-
-    fetch(apiUrl("/process_data"), { method: "POST", body: formData })
-      .then(async function (response) {
-        if (!response.ok) {
-          const text = await response.text();
-          throw new Error(text || "Process failed");
-        }
-        return response.blob();
-      })
-      .then(function (blob) {
-        downloadBlob(blob, "vendor_images.zip");
-        showStatus("ZIP generated successfully.", "success");
-      })
-      .catch(function (error) {
-        showStatus("Error: " + error.message, "error");
-      });
-  }
-
-  function initializeGrid() {
-    const container = document.getElementById("excel-grid");
-    if (!container || typeof Handsontable === "undefined") {
-      showStatus("Handsontable failed to load.", "error");
-      return;
-    }
-
-    const seedRows = [];
-    for (let i = 0; i < 500; i += 1) {
-      seedRows.push(["", ""]);
-    }
-
-    const hot = new Handsontable(container, {
-      data: seedRows,
-      colHeaders: ["A - Images", "B - Vendor Material #"],
-      rowHeaders: true,
-      height: 460,
-      stretchH: "all",
-      contextMenu: ["row_above", "row_below", "remove_row", "undo", "redo"],
-      minSpareRows: 100,
-      manualRowResize: true,
-      licenseKey: "non-commercial-and-evaluation",
-      columns: [{ renderer: imageRenderer }, { type: "text" }],
-      afterPaste: function (_data, coords) {
-        if (coords && coords[0] && coords[0].startCol === 1) {
-          showStatus("Vendor codes pasted in Column B.", "info");
-        }
-      }
-    });
-
-    window.hotInstance = hot;
-    document.addEventListener("paste", function (e) {
-      handleClipboardPaste(e, hot);
-    });
-
-    const processButton = document.getElementById("processButton");
-    if (processButton) {
-      processButton.addEventListener("click", processData);
-    }
-  }
-
-  document.addEventListener("DOMContentLoaded", initializeGrid);
-})();
-(function () {
-  "use strict";
-  if (window.__PASTE_GRID_APP_READY__) return;
-  window.__PASTE_GRID_APP_READY__ = true;
-
-  function apiUrl(path) {
-    const normalized = path.startsWith("/") ? path : "/" + path;
-    if (typeof getWebAppBackendUrl === "function") {
-      return getWebAppBackendUrl(normalized);
-    }
-    return "backend" + normalized;
-  }
-
-  function showStatus(message, type) {
-    const status = document.getElementById("status");
-    if (!status) return;
-    const kind = type || "info";
-    status.className = "status-" + kind;
-    status.textContent = message;
-  }
-
-  function escapeHtml(text) {
-    return String(text)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
-
-  function imageRenderer(instance, td, row, col, prop, value) {
-    if (value && typeof value === "string" && value.indexOf("data:image") === 0) {
-      td.innerHTML = '<div class="image-cell" style="background-image:url(' + escapeHtml(value) + ')"></div>';
-      return td;
-    }
-    Handsontable.renderers.TextRenderer.apply(this, arguments);
-    return td;
-  }
-
-  function parseImagesFromHtml(html) {
-    if (!html) return [];
-    const matches = html.match(/src\s*=\s*["']((?:data:image\/|blob:)[^"']+)["']/gi) || [];
-    return matches
-      .map(function (m) {
-        const mm = m.match(/["']((?:data:image\/|blob:)[^"']+)["']/i);
-        return mm ? mm[1] : null;
-      })
-      .filter(Boolean);
-  }
-
-  function blobToDataUrl(blob) {
-    return new Promise(function (resolve, reject) {
-      const reader = new FileReader();
-      reader.onload = function (event) {
-        resolve(event.target.result);
-      };
+      reader.onload = (e) => resolve(e.target.result);
       reader.onerror = reject;
       reader.readAsDataURL(blob);
     });
   }
 
-  async function blobUrlToDataUrl(blobUrl) {
-    if (!blobUrl || blobUrl.indexOf("blob:") !== 0) return null;
-    try {
-      const response = await fetch(blobUrl);
-      if (!response.ok) return null;
-      const blob = await response.blob();
-      if (!blob || !blob.type || blob.type.indexOf("image/") !== 0) return null;
-      return await blobToDataUrl(blob);
-    } catch (_err) {
-      return null;
-    }
-  }
-
   function isProbablyRealImage(dataUrl) {
-    if (!dataUrl || dataUrl.indexOf("data:image/") !== 0) return false;
-    // Filter tiny clipboard artifacts/icons that appear as fake "images".
-    return dataUrl.length > 1800;
+    return dataUrl && dataUrl.indexOf("data:image/") === 0 && dataUrl.length > 1000;
   }
 
+  /**
+   * FIX: This function ensures that for every image in the list, 
+   * it moves DOWN one row in the grid.
+   */
   function setImagesSequentially(hot, startRow, dataUrls) {
-    dataUrls.forEach(function (url, idx) {
-      hot.setDataAtCell(startRow + idx, 0, url, "image-paste");
+    const changes = [];
+    dataUrls.forEach((url, idx) => {
+      // Column 0 is "A - Images"
+      changes.push([startRow + idx, 0, url]);
     });
+    
+    if (changes.length > 0) {
+      hot.setDataAtCell(changes, "image-paste");
+    }
   }
 
   async function handleClipboardPaste(e, hot) {
     const selected = hot.getSelectedLast();
     if (!selected) return;
+
     const startRow = selected[0];
     const startCol = selected[1];
+
+    // Only run this custom logic if pasting into Column A
     if (startCol !== 0) return;
 
-    const html = e.clipboardData ? e.clipboardData.getData("text/html") : "";
-    const htmlImages = parseImagesFromHtml(html);
-    const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
-    const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
-    const imageItems = items.filter(function (it) {
-      return it.type && it.type.indexOf("image/") === 0;
-    });
-    const imageFiles = files.filter(function (f) {
-      return f && f.type && f.type.indexOf("image/") === 0;
-    });
-
-    // On Column A, always block default paste behavior to prevent table text
-    // (vendor codes, row numbers, etc.) from being inserted into image cells.
-    e.preventDefault();
-    e.stopPropagation();
-    if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
-
-    if (!imageItems.length && !imageFiles.length && !htmlImages.length) {
-      showStatus("No image found in clipboard for Column A.", "error");
-      return;
-    }
-
+    const items = Array.from(e.clipboardData.items || []);
     const collected = [];
 
-    for (let i = 0; i < imageFiles.length; i += 1) {
-      try {
-        const converted = await blobToDataUrl(imageFiles[i]);
-        if (converted) collected.push(converted);
-      } catch (_err) {
-        // Keep going.
-      }
-    }
-
-    for (let i = 0; i < imageItems.length; i += 1) {
-      const item = imageItems[i];
-      const blob = item.getAsFile();
-      if (!blob) continue;
-      try {
-        const converted = await blobToDataUrl(blob);
-        if (converted) collected.push(converted);
-      } catch (_err) {
-        // Keep going.
-      }
-    }
-
-    // Also parse HTML image sources (blob:/data:image) for multi-image clipboard cases.
-    for (let i = 0; i < htmlImages.length; i += 1) {
-      const src = htmlImages[i];
-      if (!src) continue;
-      if (src.indexOf("data:image/") === 0) {
-        collected.push(src);
-      } else if (src.indexOf("blob:") === 0) {
-        const converted = await blobUrlToDataUrl(src);
-        if (converted) collected.push(converted);
-      }
-    }
-
-    // Fallback only when browser did not expose image items/files/html images.
-    if (!collected.length && htmlImages.length) {
-      for (let i = 0; i < htmlImages.length; i += 1) {
-        if (htmlImages[i] && htmlImages[i].indexOf("data:image/") === 0) {
-          collected.push(htmlImages[i]);
+    // Capture Image files directly (best for copied files/screenshots)
+    for (const item of items) {
+      if (item.type.indexOf("image/") === 0) {
+        const file = item.getAsFile();
+        if (file) {
+          const dataUrl = await blobToDataUrl(file);
+          if (isProbablyRealImage(dataUrl)) collected.push(dataUrl);
         }
       }
     }
 
-    const filtered = collected.filter(isProbablyRealImage);
-    if (!filtered.length) {
-      showStatus("No readable images found in clipboard.", "error");
-      return;
+    if (collected.length > 0) {
+      // STOP the browser from doing a normal text-paste
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      
+      setImagesSequentially(hot, startRow, collected);
+      showStatus("Pasted " + collected.length + " image(s) across rows.", "success");
     }
-
-    setImagesSequentially(hot, startRow, filtered);
-    showStatus("Pasted " + filtered.length + " image(s).", "success");
   }
 
-  function buildRowsForBackend(rawData) {
-    const rows = [];
-    rawData.forEach(function (row, idx) {
-      const image = row[0];
-      const vendor = (row[1] || "").toString().trim();
-      if (!image || !vendor) return;
-      rows.push({
-        row_number: idx + 1,
-        image_data_url: image,
-        vendor_code: vendor
-      });
-    });
-    return rows;
-  }
-
-  function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename || "vendor_images.zip";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
+  // --- Backend Integration ---
   function processData() {
     const hot = window.hotInstance;
     if (!hot) return;
-    const rows = buildRowsForBackend(hot.getData());
+    
+    const rawData = hot.getData();
+    const rows = [];
+    rawData.forEach((row, idx) => {
+      if (row[0] && row[1]) { // Both Image and Vendor Code must exist
+        rows.push({
+          row_number: idx + 1,
+          image_data_url: row[0],
+          vendor_code: row[1].toString().trim()
+        });
+      }
+    });
+
     if (!rows.length) {
-      showStatus("Need both image (A) and vendor code (B) in at least one row.", "error");
+      showStatus("Error: Missing image or vendor code in rows.", "error");
       return;
     }
 
     const formData = new FormData();
     formData.append("data", JSON.stringify(rows));
-    showStatus("Generating ZIP...", "info");
+    showStatus("Sending to backend...", "info");
 
     fetch(apiUrl("/process_data"), { method: "POST", body: formData })
-      .then(async function (response) {
-        if (!response.ok) {
-          const text = await response.text();
-          throw new Error(text || "Process failed");
-        }
-        return response.blob();
+      .then(res => res.ok ? res.blob() : Promise.reject("Server Error"))
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "vendor_images.zip";
+        a.click();
+        showStatus("ZIP downloaded!", "success");
       })
-      .then(function (blob) {
-        downloadBlob(blob, "vendor_images.zip");
-        showStatus("ZIP generated successfully.", "success");
-      })
-      .catch(function (error) {
-        showStatus("Error: " + error.message, "error");
-      });
+      .catch(err => showStatus(err, "error"));
   }
 
+  // --- Initialization ---
   function initializeGrid() {
     const container = document.getElementById("excel-grid");
-    if (!container || typeof Handsontable === "undefined") {
-      showStatus("Handsontable failed to load.", "error");
-      return;
-    }
-
-    const seedRows = [];
-    for (let i = 0; i < 500; i += 1) {
-      seedRows.push(["", ""]);
-    }
+    if (!container) return;
 
     const hot = new Handsontable(container, {
-      data: seedRows,
+      data: Array.from({ length: 100 }, () => ["", ""]),
       colHeaders: ["A - Images", "B - Vendor Material #"],
       rowHeaders: true,
-      height: 460,
+      height: 500,
       stretchH: "all",
-      contextMenu: ["row_above", "row_below", "remove_row", "undo", "redo"],
-      minSpareRows: 100,
-      manualRowResize: true,
-      licenseKey: "non-commercial-and-evaluation",
+      rowHeights: 60, // Give space for images
       columns: [{ renderer: imageRenderer }, { type: "text" }],
-      afterPaste: function (_data, coords) {
-        if (coords && coords[0] && coords[0].startCol === 1) {
-          showStatus("Vendor codes pasted in Column B.", "info");
-        }
-      }
+      licenseKey: "non-commercial-and-evaluation"
     });
 
     window.hotInstance = hot;
-    document.addEventListener("paste", function (e) {
-      handleClipboardPaste(e, hot).catch(function () {
-        showStatus("Clipboard paste failed. Try paste again.", "error");
-      });
-    }, true);
 
-    const processButton = document.getElementById("processButton");
-    if (processButton) {
-      processButton.addEventListener("click", processData);
-    }
+    // Listen for paste specifically on the container to intercept it
+    container.addEventListener("paste", (e) => {
+      handleClipboardPaste(e, hot);
+    }, true); 
+
+    const btn = document.getElementById("processButton");
+    if (btn) btn.addEventListener("click", processData);
   }
 
-  document.addEventListener("DOMContentLoaded", initializeGrid);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initializeGrid);
+  } else {
+    initializeGrid();
+  }
 })();
