@@ -39,15 +39,13 @@
 
   function parseImagesFromHtml(html) {
     if (!html) return [];
-    const matches = html.match(/src\s*=\s*["'](data:image\/[^"']+)["']/gi) || [];
+    const matches = html.match(/src\s*=\s*["']((?:data:image\/|blob:)[^"']+)["']/gi) || [];
     return matches
       .map(function (m) {
-        const mm = m.match(/["'](data:image\/[^"']+)["']/i);
+        const mm = m.match(/["']((?:data:image\/|blob:)[^"']+)["']/i);
         return mm ? mm[1] : null;
       })
-      .filter(function (v) {
-        return Boolean(v) && v.length > 1000;
-      });
+      .filter(Boolean);
   }
 
   function blobToDataUrl(blob) {
@@ -59,6 +57,25 @@
       reader.onerror = reject;
       reader.readAsDataURL(blob);
     });
+  }
+
+  async function blobUrlToDataUrl(blobUrl) {
+    if (!blobUrl || blobUrl.indexOf("blob:") !== 0) return null;
+    try {
+      const response = await fetch(blobUrl);
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      if (!blob || !blob.type || blob.type.indexOf("image/") !== 0) return null;
+      return await blobToDataUrl(blob);
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function isProbablyRealImage(dataUrl) {
+    if (!dataUrl || dataUrl.indexOf("data:image/") !== 0) return false;
+    // Filter tiny clipboard artifacts/icons that appear as fake "images".
+    return dataUrl.length > 1800;
   }
 
   function setImagesSequentially(hot, startRow, dataUrls) {
@@ -111,20 +128,35 @@
       }
     }
 
-    // Fallback only when browser did not expose image items/files.
-    if (!collected.length && htmlImages.length) {
-      for (let i = 0; i < htmlImages.length; i += 1) {
-        collected.push(htmlImages[i]);
+    // Also parse HTML image sources (blob:/data:image) for multi-image clipboard cases.
+    for (let i = 0; i < htmlImages.length; i += 1) {
+      const src = htmlImages[i];
+      if (!src) continue;
+      if (src.indexOf("data:image/") === 0) {
+        collected.push(src);
+      } else if (src.indexOf("blob:") === 0) {
+        const converted = await blobUrlToDataUrl(src);
+        if (converted) collected.push(converted);
       }
     }
 
-    if (!collected.length) {
+    // Fallback only when browser did not expose image items/files/html images.
+    if (!collected.length && htmlImages.length) {
+      for (let i = 0; i < htmlImages.length; i += 1) {
+        if (htmlImages[i] && htmlImages[i].indexOf("data:image/") === 0) {
+          collected.push(htmlImages[i]);
+        }
+      }
+    }
+
+    const filtered = collected.filter(isProbablyRealImage);
+    if (!filtered.length) {
       showStatus("No readable images found in clipboard.", "error");
       return;
     }
 
-    setImagesSequentially(hot, startRow, collected);
-    showStatus("Pasted " + collected.length + " image(s).", "success");
+    setImagesSequentially(hot, startRow, filtered);
+    showStatus("Pasted " + filtered.length + " image(s).", "success");
   }
 
   function buildRowsForBackend(rawData) {
