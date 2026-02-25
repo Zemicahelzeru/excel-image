@@ -104,6 +104,10 @@
 
     if (!imageItems.length && !imageFiles.length && !htmlImages.length) return;
     e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === "function") {
+      e.stopImmediatePropagation();
+    }
 
     const collected = [];
 
@@ -250,7 +254,7 @@
       handleClipboardPaste(e, hot).catch(function () {
         showStatus("Clipboard paste failed. Try paste again.", "error");
       });
-    });
+    }, true);
 
     const processButton = document.getElementById("processButton");
     if (processButton) {
