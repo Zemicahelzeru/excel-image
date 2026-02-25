@@ -39,13 +39,15 @@
 
   function parseImagesFromHtml(html) {
     if (!html) return [];
-    const matches = html.match(/src\s*=\s*["']([^"']+)["']/gi) || [];
+    const matches = html.match(/src\s*=\s*["'](data:image\/[^"']+)["']/gi) || [];
     return matches
       .map(function (m) {
-        const mm = m.match(/["']([^"']+)["']/i);
+        const mm = m.match(/["'](data:image\/[^"']+)["']/i);
         return mm ? mm[1] : null;
       })
-      .filter(Boolean);
+      .filter(function (v) {
+        return Boolean(v) && v.length > 1000;
+      });
   }
 
   function blobToDataUrl(blob) {
@@ -57,21 +59,6 @@
       reader.onerror = reject;
       reader.readAsDataURL(blob);
     });
-  }
-
-  async function urlToDataUrl(url) {
-    if (!url) return null;
-    if (url.indexOf("data:image/") === 0) return url;
-    if (url.indexOf("blob:") !== 0) return null;
-    try {
-      const response = await fetch(url);
-      if (!response.ok) return null;
-      const blob = await response.blob();
-      if (!blob || !blob.type || blob.type.indexOf("image/") !== 0) return null;
-      return await blobToDataUrl(blob);
-    } catch (_err) {
-      return null;
-    }
   }
 
   function setImagesSequentially(hot, startRow, dataUrls) {
@@ -98,15 +85,10 @@
       return f && f.type && f.type.indexOf("image/") === 0;
     });
 
-    if (!htmlImages.length && !imageItems.length && !imageFiles.length) return;
+    if (!imageItems.length && !imageFiles.length && !htmlImages.length) return;
     e.preventDefault();
 
     const collected = [];
-
-    for (let i = 0; i < htmlImages.length; i += 1) {
-      const converted = await urlToDataUrl(htmlImages[i]);
-      if (converted) collected.push(converted);
-    }
 
     for (let i = 0; i < imageFiles.length; i += 1) {
       try {
@@ -129,22 +111,20 @@
       }
     }
 
-    const unique = [];
-    const seen = {};
-    for (let i = 0; i < collected.length; i += 1) {
-      const v = collected[i];
-      if (!v || seen[v]) continue;
-      seen[v] = true;
-      unique.push(v);
+    // Fallback only when browser did not expose image items/files.
+    if (!collected.length && htmlImages.length) {
+      for (let i = 0; i < htmlImages.length; i += 1) {
+        collected.push(htmlImages[i]);
+      }
     }
 
-    if (!unique.length) {
+    if (!collected.length) {
       showStatus("No readable images found in clipboard.", "error");
       return;
     }
 
-    setImagesSequentially(hot, startRow, unique);
-    showStatus("Pasted " + unique.length + " image(s).", "success");
+    setImagesSequentially(hot, startRow, collected);
+    showStatus("Pasted " + collected.length + " image(s).", "success");
   }
 
   function buildRowsForBackend(rawData) {
