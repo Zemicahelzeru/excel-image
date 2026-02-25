@@ -84,6 +84,21 @@
     });
   }
 
+  function pasteVendorCodesFromText(hot, startRow, text) {
+    if (!text) return 0;
+    const rows = text.replace(/\r/g, "").split("\n").filter(Boolean);
+    let pasted = 0;
+    for (let i = 0; i < rows.length; i += 1) {
+      const cols = rows[i].split("\t");
+      // If copied range has at least 2 columns, col index 1 is vendor.
+      if (cols.length > 1 && cols[1] && cols[1].trim()) {
+        hot.setDataAtCell(startRow + i, 1, cols[1].trim(), "vendor-paste");
+        pasted += 1;
+      }
+    }
+    return pasted;
+  }
+
   async function handleClipboardPaste(e, hot) {
     const selected = hot.getSelectedLast();
     if (!selected) return;
@@ -92,6 +107,7 @@
     if (startCol !== 0) return;
 
     const html = e.clipboardData ? e.clipboardData.getData("text/html") : "";
+    const plainText = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
     const htmlImages = parseImagesFromHtml(html);
     const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
     const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
@@ -160,7 +176,15 @@
     }
 
     setImagesSequentially(hot, startRow, filtered);
-    showStatus("Pasted " + filtered.length + " image(s).", "success");
+    const vendorCount = pasteVendorCodesFromText(hot, startRow, plainText);
+    if (vendorCount > 0) {
+      showStatus(
+        "Pasted " + filtered.length + " image(s) and " + vendorCount + " vendor code(s).",
+        "success"
+      );
+    } else {
+      showStatus("Pasted " + filtered.length + " image(s).", "success");
+    }
   }
 
   function buildRowsForBackend(rawData) {
